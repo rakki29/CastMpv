@@ -33,7 +33,7 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Download latest libmpv (${{ matrix.arch }}) from shinchiro/mpv-winbuild-cmake
+      - name: Download & verify clean static libmpv-2.dll (${{ matrix.arch }})
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -42,36 +42,98 @@ jobs:
             $headers['Authorization'] = "Bearer $env:GITHUB_TOKEN"
           }
 
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest" -Headers $headers
+          $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases?per_page=10" -Headers $headers
           $pattern = "${{ matrix.mpv_pattern }}"
-          $asset = $release.assets | Where-Object { $_.name -like $pattern -and $_.name -notlike "*v3*" } | Select-Object -First 1
-          if (-not $asset) {
-            $asset = $release.assets | Where-Object { $_.name -like $pattern } | Select-Object -First 1
-          }
-          if (-not $asset) {
-            throw "Could not find matching libmpv asset for pattern $pattern"
-          }
-
-          Write-Host "Downloading $($asset.name) ($([math]::Round($asset.size / 1MB, 2)) MB)..."
-          $archivePath = Join-Path $env:RUNNER_TEMP $asset.name
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archivePath
-
-          $extractDir = Join-Path $env:RUNNER_TEMP "mpv-extract-${{ matrix.arch }}"
-          New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
-          7z x $archivePath "-o$extractDir" -y | Out-Null
-
-          $dll = Get-ChildItem -Path $extractDir -Recurse -Filter "libmpv-2.dll" | Select-Object -First 1
-          if (-not $dll) {
-            $dll = Get-ChildItem -Path $extractDir -Recurse -Filter "mpv-2.dll" | Select-Object -First 1
-          }
-          if (-not $dll) {
-            throw "libmpv-2.dll not found inside $($asset.name)"
-          }
-
           $nativeDir = "CastMPV/native/${{ matrix.arch }}"
           New-Item -ItemType Directory -Force -Path $nativeDir | Out-Null
-          Copy-Item $dll.FullName -Destination (Join-Path $nativeDir "libmpv-2.dll") -Force
-          Write-Host "Copied libmpv-2.dll ($([math]::Round($dll.Length / 1MB, 2)) MB) to $nativeDir"
+
+          # Create a lightweight native smoke-test project to verify mpv_create + mpv_initialize on Windows
+          $probeDir = Join-Path $env:RUNNER_TEMP "mpv-probe-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+          @'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net48</TargetFramework>
+              <PlatformTarget>$(Platform)</PlatformTarget>
+            </PropertyGroup>
+          </Project>
+          '@ | Set-Content (Join-Path $probeDir "MpvProbe.csproj")
+
+          @'
+          using System;
+          using System.Runtime.InteropServices;
+          using System.Text;
+          class Program {
+              [DllImport("libmpv-2.dll", CallingConvention = CallingConvention.Cdecl)] static extern IntPtr mpv_create();
+              [DllImport("libmpv-2.dll", CallingConvention = CallingConvention.Cdecl)] static extern int mpv_set_option_string(IntPtr ctx, byte[] name, byte[] val);
+              [DllImport("libmpv-2.dll", CallingConvention = CallingConvention.Cdecl)] static extern int mpv_initialize(IntPtr ctx);
+              [DllImport("libmpv-2.dll", CallingConvention = CallingConvention.Cdecl)] static extern void mpv_terminate_destroy(IntPtr ctx);
+              static byte[] U(string s) => Encoding.UTF8.GetBytes(s + "\0");
+              static int Main() {
+                  Environment.SetEnvironmentVariable("OPENSSL_CONF", null);
+                  Environment.SetEnvironmentVariable("OPENSSL_MODULES", null);
+                  IntPtr ctx = mpv_create();
+                  if (ctx == IntPtr.Zero) return 2;
+                  mpv_set_option_string(ctx, U("vo"), U("null"));
+                  mpv_set_option_string(ctx, U("ao"), U("null"));
+                  mpv_set_option_string(ctx, U("ytdl"), U("no"));
+                  int rc = mpv_initialize(ctx);
+                  mpv_terminate_destroy(ctx);
+                  return rc < 0 ? 3 : 0;
+              }
+          }
+          '@ | Set-Content (Join-Path $probeDir "Program.cs")
+
+          dotnet build (Join-Path $probeDir "MpvProbe.csproj") -c Release -p:Platform=${{ matrix.arch }} -o $probeDir | Out-Null
+
+          $verified = $false
+          foreach ($rel in $releases) {
+            # Prefer Schannel/GnuTLS variants if tagged, otherwise standard static mpv-dev archive (non-v3)
+            $asset = $rel.assets | Where-Object { $_.name -like $pattern -and ($_.name -like "*schannel*" -or $_.name -like "*gnutls*") } | Select-Object -First 1
+            if (-not $asset) {
+              $asset = $rel.assets | Where-Object { $_.name -like $pattern -and $_.name -notlike "*v3*" } | Select-Object -First 1
+            }
+            if (-not $asset) {
+              $asset = $rel.assets | Where-Object { $_.name -like $pattern } | Select-Object -First 1
+            }
+            if (-not $asset) { continue }
+
+            Write-Host "Testing $($rel.tag_name) -> $($asset.name)..."
+            $archivePath = Join-Path $env:RUNNER_TEMP $asset.name
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archivePath
+
+            $extractDir = Join-Path $env:RUNNER_TEMP "mpv-extract-${{ matrix.arch }}"
+            if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
+            New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+            7z x $archivePath "-o$extractDir" -y | Out-Null
+
+            $dll = Get-ChildItem -Path $extractDir -Recurse -Filter "libmpv-2.dll" | Select-Object -First 1
+            if (-not $dll) { continue }
+
+            # Verify no external libcrypto/libssl DLL dependencies exist in the archive
+            $externalSsl = Get-ChildItem -Path $extractDir -Recurse -Include "libcrypto*.dll","libssl*.dll"
+            if ($externalSsl) {
+              Write-Host "Skipping $($asset.name): contains external OpenSSL DLLs."
+              continue
+            }
+
+            # Live Windows smoke test (mpv_create + mpv_initialize)
+            Copy-Item $dll.FullName -Destination (Join-Path $probeDir "libmpv-2.dll") -Force
+            $proc = Start-Process -FilePath (Join-Path $probeDir "MpvProbe.exe") -WorkingDirectory $probeDir -Wait -PassThru -NoNewWindow
+            if ($proc.ExitCode -eq 0) {
+              Copy-Item $dll.FullName -Destination (Join-Path $nativeDir "libmpv-2.dll") -Force
+              Write-Host "Verified clean libmpv-2.dll ($([math]::Round($dll.Length / 1MB, 2)) MB) from $($rel.tag_name)"
+              $verified = $true
+              break
+            } else {
+              Write-Warning "$($asset.name) failed Windows smoke test (exit code $($proc.ExitCode)); trying previous release..."
+            }
+          }
+
+          if (-not $verified) {
+            throw "Failed to find a verified libmpv-2.dll build for ${{ matrix.arch }}"
+          }
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -86,9 +148,7 @@ jobs:
           if (-not (Test-Path "$distDir/CastMPV.exe")) { throw "CastMPV.exe missing!" }
           if (-not (Test-Path "$distDir/libmpv-2.dll")) { throw "libmpv-2.dll missing!" }
 
-          # Remove XML documentation/PDB clutter if any to keep footprint minimal
           Get-ChildItem -Path $distDir -Include *.pdb,*.xml -Recurse | Remove-Item -Force
-
           Copy-Item "CastMPV/README.md" -Destination "$distDir/README.txt" -Force
 
           $totalBytes = (Get-ChildItem -Path $distDir -Recurse | Measure-Object -Property Length -Sum).Sum
@@ -123,6 +183,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*.zip
-          generate_release_notes: true
+          generate-release-notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

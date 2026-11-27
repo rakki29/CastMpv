@@ -71,58 +71,53 @@ namespace CastMPV.Player
 
         public bool Initialize(IntPtr windowHandle, AppSettings settings, out string errorMessage)
         {
-            if (!MpvNative.EnsureLibraryLoaded(out errorMessage))
-                return false;
-
-            _mpv = MpvNative.mpv_create();
-            if (_mpv == IntPtr.Zero)
-            {
-                errorMessage = "mpv_create() returned null.";
-                return false;
-            }
-
             long wid = windowHandle.ToInt64();
-            MpvNative.mpv_set_option(_mpv, MpvNative.ToUtf8("wid"), MpvFormat.Int64, ref wid);
 
-            // Disable built-in OSC/keybindings so CastMPV UI stays in full control
-            SetOption("osc", "no");
-            SetOption("osd-level", "1");
-            SetOption("input-default-bindings", "no");
-            SetOption("input-vo-keyboard", "no");
-            SetOption("keep-open", "no");
-            SetOption("idle", "yes");
-            SetOption("force-window", "no");
-
-            // Video output & hardware decoding with automatic software fallback
-            SetOption("vo", "gpu,direct3d,sdl");
-            SetOption("hwdec", settings.HardwareAcceleration ? "auto-safe" : "no");
-
-            // Robust stream caching & reconnect for HTTP/HLS/DASH/IPTV
-            SetOption("cache", "yes");
-            SetOption("demuxer-max-bytes", "150MiB");
-            SetOption("demuxer-max-back-bytes", "50MiB");
-            SetOption("network-timeout", "15");
-            SetOption("stream-lavf-o", "reconnect=1,reconnect_streamed=1,reconnect_delay_max=5");
-            SetOption("ytdl", "no");
-
-            // Full UTF-8 / Arabic RTL shaping & subtitle defaults
-            SetOption("sub-auto", "fuzzy");
-            SetOption("sub-font-provider", "auto");
-            ApplySubtitleOptionsBeforeInit(settings);
-
-            // Screenshot settings
-            Directory.CreateDirectory(settings.ScreenshotDirectory);
-            SetOption("screenshot-format", "png");
-            SetOption("screenshot-directory", settings.ScreenshotDirectory);
-
-            int initRes = MpvNative.mpv_initialize(_mpv);
-            if (initRes < 0)
+            bool ok = MpvNative.CreateAndInitializeOnMtaThread(ctx =>
             {
-                errorMessage = "mpv_initialize failed: " + MpvNative.GetErrorString(initRes);
-                MpvNative.mpv_terminate_destroy(_mpv);
+                _mpv = ctx;
+
+                MpvNative.mpv_set_option(ctx, MpvNative.ToUtf8("wid"), MpvFormat.Int64, ref wid);
+
+                // Disable built-in OSC/keybindings so CastMPV UI stays in full control
+                SetOption("osc", "no");
+                SetOption("osd-level", "1");
+                SetOption("input-default-bindings", "no");
+                SetOption("input-vo-keyboard", "no");
+                SetOption("keep-open", "no");
+                SetOption("idle", "yes");
+                SetOption("force-window", "no");
+
+                // Video output & hardware decoding with automatic software fallback
+                SetOption("vo", "gpu,direct3d,sdl");
+                SetOption("hwdec", settings.HardwareAcceleration ? "auto-safe" : "no");
+
+                // Robust stream caching & reconnect for HTTP/HLS/DASH/IPTV
+                SetOption("cache", "yes");
+                SetOption("demuxer-max-bytes", "150MiB");
+                SetOption("demuxer-max-back-bytes", "50MiB");
+                SetOption("network-timeout", "15");
+                SetOption("stream-lavf-o", "reconnect=1,reconnect_streamed=1,reconnect_delay_max=5");
+                SetOption("ytdl", "no");
+
+                // Full UTF-8 / Arabic RTL shaping & subtitle defaults
+                SetOption("sub-auto", "fuzzy");
+                SetOption("sub-font-provider", "auto");
+                ApplySubtitleOptionsBeforeInit(settings);
+
+                // Screenshot settings
+                Directory.CreateDirectory(settings.ScreenshotDirectory);
+                SetOption("screenshot-format", "png");
+                SetOption("screenshot-directory", settings.ScreenshotDirectory);
+            }, out IntPtr initializedCtx, out errorMessage);
+
+            if (!ok)
+            {
                 _mpv = IntPtr.Zero;
                 return false;
             }
+
+            _mpv = initializedCtx;
 
             SetVolume(settings.DefaultVolume);
             ApplySubtitleSettings(settings);

@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 namespace CastMPV.Player
 {
@@ -80,6 +81,14 @@ namespace CastMPV.Player
     {
         private const string DllName = "libmpv-2.dll";
         private const uint LOAD_WITH_ALTERED_SEARCH_PATH = 0x00000008;
+        private const uint LOAD_LIBRARY_SEARCH_APPLICATION_DIR = 0x00000200;
+        private const uint LOAD_LIBRARY_SEARCH_USER_DIRS = 0x00000400;
+        private const uint LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800;
+        private const int LC_NUMERIC = 4;
+
+        private static readonly object _initLock = new object();
+        private static volatile bool _dllLoaded;
+        private static string _loadedDllDirectory;
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern IntPtr LoadLibrary(string lpFileName);
@@ -87,58 +96,195 @@ namespace CastMPV.Player
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern IntPtr LoadLibraryEx(string lpFileName, IntPtr hReservedNull, uint dwFlags);
 
-        public static bool EnsureLibraryLoaded(out string errorMessage)
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetDefaultDllDirectories(uint DirectoryFlags);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr AddDllDirectory(string NewDirectory);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool SetDllDirectory(string lpPathName);
+
+        [DllImport("msvcrt.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+        private static extern IntPtr setlocale(int category, string locale);
+
+        public static void IsolateProcessEnvironment()
         {
-            // Prevent external system OpenSSL env vars (e.g., from Git/Perl/OpenVPN)
-            // from interfering with internal TLS/crypto inside libmpv-2.dll.
+            // Clear OpenSSL/TLS environment variables inherited from system tools
+            // (Git, Strawberry Perl, OpenVPN, Python, etc.) before loading libmpv-2.dll.
+            string[] varsToClear =
+            {
+                "OPENSSL_CONF",
+                "OPENSSL_MODULES",
+                "OPENSSL_ENGINES",
+                "OPENSSL_FORCE_FIPS_MODE",
+                "OPENSSL_WIN32_UTF8",
+                "RANDFILE",
+                "SSL_CERT_FILE",
+                "SSL_CERT_DIR",
+                "CURL_CA_BUNDLE"
+            };
+
+            foreach (string varName in varsToClear)
+            {
+                try { Environment.SetEnvironmentVariable(varName, null); } catch { }
+            }
+
+            // libmpv requires CRT LC_NUMERIC to be "C"
+            try { setlocale(LC_NUMERIC, "C"); } catch { }
+        }
+
+        private static void IsolateDllDirectory(string dllDir)
+        {
+            if (string.IsNullOrWhiteSpace(dllDir)) return;
+
             try
             {
-                Environment.SetEnvironmentVariable("OPENSSL_CONF", null);
-                Environment.SetEnvironmentVariable("OPENSSL_MODULES", null);
-                Environment.SetEnvironmentVariable("OPENSSL_ENGINES", null);
+                // Restrict DLL search strictly to app dir, added dir, and System32
+                // so conflicting system PATH DLLs (e.g., third-party libcrypto/libssl) are never loaded.
+                if (SetDefaultDllDirectories(
+                    LOAD_LIBRARY_SEARCH_APPLICATION_DIR |
+                    LOAD_LIBRARY_SEARCH_USER_DIRS |
+                    LOAD_LIBRARY_SEARCH_SYSTEM32))
+                {
+                    AddDllDirectory(dllDir);
+                    return;
+                }
             }
             catch
             {
-                // Ignore if restricted
+                // Fallback on unpatched Windows 7
             }
 
-            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            string archDir = Environment.Is64BitProcess ? "x64" : "x86";
-            string[] candidates =
-            {
-                Path.Combine(baseDir, DllName),
-                Path.Combine(baseDir, archDir, DllName),
-                Path.Combine(baseDir, "native", archDir, DllName)
-            };
+            try { SetDllDirectory(dllDir); } catch { }
+        }
 
-            foreach (string path in candidates)
+        public static bool EnsureLibraryLoaded(out string errorMessage)
+        {
+            lock (_initLock)
             {
-                if (File.Exists(path))
+                if (_dllLoaded)
                 {
+                    errorMessage = null;
+                    return true;
+                }
+
+                IsolateProcessEnvironment();
+
+                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                string archDir = Environment.Is64BitProcess ? "x64" : "x86";
+                string[] candidates =
+                {
+                    Path.Combine(baseDir, DllName),
+                    Path.Combine(baseDir, archDir, DllName),
+                    Path.Combine(baseDir, "native", archDir, DllName)
+                };
+
+                foreach (string path in candidates)
+                {
+                    if (!File.Exists(path)) continue;
+
+                    string dir = Path.GetDirectoryName(path);
+                    IsolateDllDirectory(dir);
+
                     IntPtr h = LoadLibraryEx(path, IntPtr.Zero, LOAD_WITH_ALTERED_SEARCH_PATH);
                     if (h == IntPtr.Zero)
                         h = LoadLibrary(path);
 
                     if (h != IntPtr.Zero)
                     {
+                        _dllLoaded = true;
+                        _loadedDllDirectory = dir;
                         errorMessage = null;
                         return true;
                     }
                 }
-            }
 
-            // Try system PATH fallback
-            IntPtr sysHandle = LoadLibrary(DllName);
-            if (sysHandle != IntPtr.Zero)
+                // Fallback to System32 / isolated search
+                IntPtr sysHandle = LoadLibrary(DllName);
+                if (sysHandle != IntPtr.Zero)
+                {
+                    _dllLoaded = true;
+                    errorMessage = null;
+                    return true;
+                }
+
+                errorMessage =
+                    $"Could not load {DllName} ({archDir}).\n\n" +
+                    $"Please place the {archDir} version of {DllName} in:\n{baseDir}";
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Safely isolates environment/DLL paths, calls mpv_create(), applies options,
+        /// and calls mpv_initialize() on a dedicated MTA thread to avoid WinForms STA COM
+        /// and OpenSSL/CRT thread-locking conflicts on Windows.
+        /// </summary>
+        public static bool CreateAndInitializeOnMtaThread(
+            Action<IntPtr> configureOptions,
+            out IntPtr ctx,
+            out string errorMessage)
+        {
+            IntPtr createdCtx = IntPtr.Zero;
+            string threadError = null;
+
+            var initThread = new Thread(() =>
             {
-                errorMessage = null;
-                return true;
-            }
+                lock (_initLock)
+                {
+                    if (!EnsureLibraryLoaded(out string loadErr))
+                    {
+                        threadError = loadErr;
+                        return;
+                    }
 
-            errorMessage =
-                $"Could not load {DllName} ({archDir}).\n\n" +
-                $"Please place the {archDir} version of {DllName} in:\n{baseDir}";
-            return false;
+                    // Re-ensure clean CRT locale & env on the dedicated MTA thread
+                    IsolateProcessEnvironment();
+                    if (!string.IsNullOrEmpty(_loadedDllDirectory))
+                        IsolateDllDirectory(_loadedDllDirectory);
+
+                    createdCtx = mpv_create();
+                    if (createdCtx == IntPtr.Zero)
+                    {
+                        threadError = "mpv_create() returned null.";
+                        return;
+                    }
+
+                    try
+                    {
+                        configureOptions?.Invoke(createdCtx);
+                        int res = mpv_initialize(createdCtx);
+                        if (res < 0)
+                        {
+                            threadError = "mpv_initialize failed: " + GetErrorString(res);
+                            mpv_terminate_destroy(createdCtx);
+                            createdCtx = IntPtr.Zero;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        threadError = "libmpv initialization exception: " + ex.Message;
+                        if (createdCtx != IntPtr.Zero)
+                        {
+                            try { mpv_terminate_destroy(createdCtx); } catch { }
+                            createdCtx = IntPtr.Zero;
+                        }
+                    }
+                }
+            })
+            {
+                IsBackground = true,
+                Name = "CastMPV-MpvInit-MTA"
+            };
+
+            initThread.SetApartmentState(ApartmentState.MTA);
+            initThread.Start();
+            initThread.Join();
+
+            ctx = createdCtx;
+            errorMessage = threadError;
+            return ctx != IntPtr.Zero && string.IsNullOrEmpty(errorMessage);
         }
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
