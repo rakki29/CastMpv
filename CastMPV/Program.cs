@@ -93,7 +93,10 @@ namespace CastMPV
                 _dlnaStatusItem.Click += (s, e) => ToggleDlnaServer();
 
                 var settingsItem = new ToolStripMenuItem("Settings...");
-                settingsItem.Click += (s, e) => OpenSettings();
+                settingsItem.Click += (s, e) => OpenSettings(0);
+
+                var subSettingsItem = new ToolStripMenuItem("Subtitle Settings...");
+                subSettingsItem.Click += (s, e) => OpenSettings(1);
 
                 var exitItem = new ToolStripMenuItem("Exit CastMPV");
                 exitItem.Click += (s, e) => ExitApplication();
@@ -106,6 +109,7 @@ namespace CastMPV
                     _dlnaStatusItem,
                     _autoStartItem,
                     settingsItem,
+                    subSettingsItem,
                     new ToolStripSeparator(),
                     exitItem
                 });
@@ -185,14 +189,19 @@ namespace CastMPV
                 StartOrRestartDlnaServer();
             }
 
-            private void OpenSettings()
+            private void OpenSettings(int initialTab = 0)
             {
                 _mainForm.EnsureVisibleAndFocused();
                 string oldName = _settings.DeviceName;
                 int oldPort = _settings.DlnaPort;
                 bool oldEnabled = _settings.DlnaEnabled;
 
-                using var dlg = new SettingsForm(_settings);
+                using var dlg = new SettingsForm(
+                    _settings,
+                    initialTab,
+                    applyLiveCallback: () => _mainForm.ApplySettings(),
+                    loadSubtitleCallback: path => _mainForm.Player.AddExternalSubtitle(path));
+
                 if (dlg.ShowDialog(_mainForm) == DialogResult.OK)
                 {
                     _autoStartItem.Checked = StartupManager.IsAutoStartEnabled();

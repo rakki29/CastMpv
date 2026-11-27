@@ -282,7 +282,11 @@ namespace CastMPV.UI
             Font = new Font("Segoe UI", 8.5f, FontStyle.Regular);
             Cursor = Cursors.Hand;
             TabStop = false;
-            Padding = new Padding(4, 0, 4, 0);
+            AutoSize = true;
+            AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            UseCompatibleTextRendering = false;
+            TextAlign = ContentAlignment.MiddleCenter;
+            Padding = new Padding(10, 4, 10, 4);
         }
     }
 

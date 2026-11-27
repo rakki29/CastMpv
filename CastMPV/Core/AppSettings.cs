@@ -39,11 +39,48 @@ namespace CastMPV.Core
         [DataMember]
         public int DefaultVolume { get; set; } = 85;
 
+        // Comprehensive PotPlayer-style Subtitle Settings
+        [DataMember]
+        public string SubtitleFontFamily { get; set; } = "Segoe UI";
+
+        [DataMember]
+        public bool SubtitleBold { get; set; } = false;
+
         [DataMember]
         public int SubtitleFontSize { get; set; } = 48;
 
         [DataMember]
         public string SubtitleColor { get; set; } = "#FFFFFF";
+
+        [DataMember]
+        public int SubtitleOpacity { get; set; } = 100;
+
+        [DataMember]
+        public string SubtitleBackColor { get; set; } = "#000000";
+
+        [DataMember]
+        public int SubtitleBackOpacity { get; set; } = 55;
+
+        [DataMember]
+        public double SubtitleBorderSize { get; set; } = 2.0;
+
+        [DataMember]
+        public string SubtitleBorderColor { get; set; } = "#000000";
+
+        [DataMember]
+        public double SubtitleShadowOffset { get; set; } = 1.0;
+
+        [DataMember]
+        public int SubtitlePosition { get; set; } = 96;
+
+        [DataMember]
+        public double SubtitleDefaultDelay { get; set; } = 0.0;
+
+        [DataMember]
+        public string SubtitleAssOverride { get; set; } = "yes";
+
+        [DataMember]
+        public string SubtitleCodepage { get; set; } = "auto";
 
         [DataMember]
         public string DefaultUserAgent { get; set; } = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
@@ -95,10 +132,32 @@ namespace CastMPV.Core
                 DeviceUuid = Guid.NewGuid().ToString("D");
             if (DefaultVolume < 0 || DefaultVolume > 100)
                 DefaultVolume = 85;
+
+            if (string.IsNullOrWhiteSpace(SubtitleFontFamily))
+                SubtitleFontFamily = "Segoe UI";
             if (SubtitleFontSize < 16 || SubtitleFontSize > 120)
                 SubtitleFontSize = 48;
             if (string.IsNullOrWhiteSpace(SubtitleColor) || !SubtitleColor.StartsWith("#"))
                 SubtitleColor = "#FFFFFF";
+            if (SubtitleOpacity < 0 || SubtitleOpacity > 100)
+                SubtitleOpacity = 100;
+            if (string.IsNullOrWhiteSpace(SubtitleBackColor) || !SubtitleBackColor.StartsWith("#"))
+                SubtitleBackColor = "#000000";
+            if (SubtitleBackOpacity < 0 || SubtitleBackOpacity > 100)
+                SubtitleBackOpacity = 55;
+            if (SubtitleBorderSize < 0 || SubtitleBorderSize > 10)
+                SubtitleBorderSize = 2.0;
+            if (string.IsNullOrWhiteSpace(SubtitleBorderColor) || !SubtitleBorderColor.StartsWith("#"))
+                SubtitleBorderColor = "#000000";
+            if (SubtitleShadowOffset < 0 || SubtitleShadowOffset > 12)
+                SubtitleShadowOffset = 1.0;
+            if (SubtitlePosition < 0 || SubtitlePosition > 100)
+                SubtitlePosition = 96;
+            if (string.IsNullOrWhiteSpace(SubtitleAssOverride))
+                SubtitleAssOverride = "yes";
+            if (string.IsNullOrWhiteSpace(SubtitleCodepage))
+                SubtitleCodepage = "auto";
+
             if (string.IsNullOrWhiteSpace(ScreenshotDirectory))
                 ScreenshotDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "CastMPV");
         }

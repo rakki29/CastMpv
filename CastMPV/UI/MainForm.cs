@@ -16,7 +16,7 @@ namespace CastMPV.UI
 
         private readonly AppSettings _settings;
         private readonly MpvPlayer _player;
-        private readonly Action _openSettingsCallback;
+        private readonly Action<int> _openSettingsCallback;
 
         private Panel _topBar;
         private Label _lblTitle;
@@ -60,15 +60,15 @@ namespace CastMPV.UI
 
         public MpvPlayer Player => _player;
 
-        public MainForm(AppSettings settings, Action openSettingsCallback)
+        public MainForm(AppSettings settings, Action<int> openSettingsCallback)
         {
             _settings = settings;
             _openSettingsCallback = openSettingsCallback;
             _player = new MpvPlayer();
 
             Text = "CastMPV";
-            Size = new Size(1060, 640);
-            MinimumSize = new Size(640, 400);
+            Size = new Size(1160, 680);
+            MinimumSize = new Size(980, 520);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = ThemePalette.BgCanvas;
             ForeColor = ThemePalette.TextPrimary;
@@ -93,9 +93,9 @@ namespace CastMPV.UI
             _topBar = new Panel
             {
                 Dock = DockStyle.Top,
-                Height = 36,
+                Height = 40,
                 BackColor = ThemePalette.BgSurface,
-                Padding = new Padding(10, 4, 10, 4)
+                Padding = new Padding(12, 5, 12, 5)
             };
 
             var lblBrand = new Label
@@ -104,9 +104,9 @@ namespace CastMPV.UI
                 Dock = DockStyle.Left,
                 AutoSize = true,
                 ForeColor = ThemePalette.Accent,
-                Font = new Font("Segoe UI", 10f, FontStyle.Bold),
+                Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
                 TextAlign = ContentAlignment.MiddleLeft,
-                Padding = new Padding(0, 4, 10, 0)
+                Padding = new Padding(0, 4, 14, 0)
             };
 
             _lblTitle = new Label
@@ -116,22 +116,26 @@ namespace CastMPV.UI
                 ForeColor = ThemePalette.TextMuted,
                 Font = new Font("Segoe UI", 9f),
                 TextAlign = ContentAlignment.MiddleLeft,
-                AutoEllipsis = true
+                AutoEllipsis = true,
+                Padding = new Padding(0, 2, 10, 0)
             };
 
             var topRight = new FlowLayoutPanel
             {
                 Dock = DockStyle.Right,
                 AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 FlowDirection = FlowDirection.LeftToRight,
                 WrapContents = false,
-                BackColor = Color.Transparent
+                BackColor = Color.Transparent,
+                Margin = new Padding(0),
+                Padding = new Padding(0)
             };
 
-            var btnOpenFile = MakeTopButton("Open File", 76, (s, e) => OpenFileDialog());
-            var btnOpenUrl = MakeTopButton("Open URL", 74, (s, e) => OpenUrlDialog());
-            _btnPin = MakeTopButton("Pin", 44, (s, e) => ToggleAlwaysOnTop());
-            var btnSettings = MakeTopButton("Settings", 68, (s, e) => _openSettingsCallback?.Invoke());
+            var btnOpenFile = MakeTopButton("Open File", (s, e) => OpenFileDialog());
+            var btnOpenUrl = MakeTopButton("Open URL", (s, e) => OpenUrlDialog());
+            _btnPin = MakeTopButton("Pin", (s, e) => ToggleAlwaysOnTop());
+            var btnSettings = MakeTopButton("Settings", (s, e) => _openSettingsCallback?.Invoke(0));
 
             topRight.Controls.AddRange(new Control[] { btnOpenFile, btnOpenUrl, _btnPin, btnSettings });
             _topBar.Controls.Add(_lblTitle);
@@ -142,9 +146,9 @@ namespace CastMPV.UI
             _bottomBar = new Panel
             {
                 Dock = DockStyle.Bottom,
-                Height = 68,
+                Height = 74,
                 BackColor = ThemePalette.BgSurface,
-                Padding = new Padding(8, 2, 8, 6)
+                Padding = new Padding(10, 2, 10, 6)
             };
 
             _seekBar = new SeekTrackBar
@@ -164,14 +168,17 @@ namespace CastMPV.UI
             {
                 Dock = DockStyle.Left,
                 AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 WrapContents = false,
-                BackColor = Color.Transparent
+                BackColor = Color.Transparent,
+                Margin = new Padding(0),
+                Padding = new Padding(0)
             };
 
-            _btnPlayPause = MakeControlButton("Play", 52, (s, e) => _player.TogglePause());
-            _btnStop = MakeControlButton("Stop", 48, (s, e) => StopPlayback());
-            _btnBack10 = MakeControlButton("-10s", 44, (s, e) => _player.SeekRelative(-10));
-            _btnFwd10 = MakeControlButton("+10s", 44, (s, e) => _player.SeekRelative(10));
+            _btnPlayPause = MakeControlButton("Play", (s, e) => _player.TogglePause());
+            _btnStop = MakeControlButton("Stop", (s, e) => StopPlayback());
+            _btnBack10 = MakeControlButton("-10s", (s, e) => _player.SeekRelative(-10));
+            _btnFwd10 = MakeControlButton("+10s", (s, e) => _player.SeekRelative(10));
             _lblTime = new Label
             {
                 Text = "00:00 / 00:00",
@@ -186,22 +193,25 @@ namespace CastMPV.UI
             {
                 Dock = DockStyle.Right,
                 AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
                 WrapContents = false,
-                BackColor = Color.Transparent
+                BackColor = Color.Transparent,
+                Margin = new Padding(0),
+                Padding = new Padding(0)
             };
 
-            _btnMute = MakeControlButton("Vol", 38, (s, e) => _player.ToggleMute());
+            _btnMute = MakeControlButton("Volume", (s, e) => _player.ToggleMute());
             _volumeSlider = new VolumeSlider
             {
                 Value = _settings.DefaultVolume,
-                Margin = new Padding(2, 4, 8, 0)
+                Margin = new Padding(2, 5, 8, 0)
             };
-            _btnSpeed = MakeControlButton("1.0x", 48, ShowSpeedMenu);
-            _btnAspect = MakeControlButton("Original", 64, ShowAspectMenu);
-            _btnSubs = MakeControlButton("Subtitles", 68, ShowSubtitleMenu);
-            _btnAudio = MakeControlButton("Audio", 54, ShowAudioMenu);
-            _btnShot = MakeControlButton("Shot", 48, (s, e) => TakeScreenshot());
-            _btnFullscreen = MakeControlButton("Full", 46, (s, e) => ToggleFullscreen());
+            _btnSpeed = MakeControlButton("1.0x", ShowSpeedMenu);
+            _btnAspect = MakeControlButton("Original", ShowAspectMenu);
+            _btnSubs = MakeControlButton("Subtitles", ShowSubtitleMenu);
+            _btnAudio = MakeControlButton("Audio", ShowAudioMenu);
+            _btnShot = MakeControlButton("Screenshot", (s, e) => TakeScreenshot());
+            _btnFullscreen = MakeControlButton("Fullscreen", (s, e) => ToggleFullscreen());
 
             rightFlow.Controls.AddRange(new Control[]
             {
@@ -272,25 +282,31 @@ namespace CastMPV.UI
             _mousePollTimer.Tick += PollMouseInFullscreen;
         }
 
-        private DarkFlatButton MakeTopButton(string text, int width, EventHandler onClick)
+        private static DarkFlatButton MakeTopButton(string text, EventHandler onClick)
         {
             var btn = new DarkFlatButton
             {
                 Text = text,
-                Size = new Size(width, 28),
-                Margin = new Padding(2, 0, 2, 0)
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                MinimumSize = new Size(0, 28),
+                Padding = new Padding(10, 4, 10, 4),
+                Margin = new Padding(3, 0, 3, 0)
             };
             btn.Click += onClick;
             return btn;
         }
 
-        private DarkFlatButton MakeControlButton(string text, int width, EventHandler onClick)
+        private static DarkFlatButton MakeControlButton(string text, EventHandler onClick)
         {
             var btn = new DarkFlatButton
             {
                 Text = text,
-                Size = new Size(width, 32),
-                Margin = new Padding(2, 0, 2, 0)
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                MinimumSize = new Size(0, 32),
+                Padding = new Padding(9, 5, 9, 5),
+                Margin = new Padding(2, 1, 2, 0)
             };
             btn.Click += onClick;
             return btn;
@@ -312,10 +328,11 @@ namespace CastMPV.UI
             _videoContextMenu.Items.Add("Stop", null, (s, e) => StopPlayback());
             _videoContextMenu.Items.Add(new ToolStripSeparator());
             _videoContextMenu.Items.Add("Load External Subtitle...", null, (s, e) => LoadSubtitleDialog());
+            _videoContextMenu.Items.Add("Subtitle Settings...", null, (s, e) => _openSettingsCallback?.Invoke(1));
             _videoContextMenu.Items.Add("Capture Screenshot", null, (s, e) => TakeScreenshot());
             _videoContextMenu.Items.Add("Toggle Fullscreen", null, (s, e) => ToggleFullscreen());
             _videoContextMenu.Items.Add(new ToolStripSeparator());
-            _videoContextMenu.Items.Add("Settings...", null, (s, e) => _openSettingsCallback?.Invoke());
+            _videoContextMenu.Items.Add("Settings...", null, (s, e) => _openSettingsCallback?.Invoke(0));
 
             _mpvHostPanel.ContextMenuStrip = _videoContextMenu;
             _lblIdleHint.ContextMenuStrip = _videoContextMenu;
@@ -363,7 +380,7 @@ namespace CastMPV.UI
 
             _player.MuteChanged += muted => BeginUi(() =>
             {
-                _btnMute.Text = muted ? "Muted" : "Vol";
+                _btnMute.Text = muted ? "Muted" : "Volume";
                 _btnMute.ForeColor = muted ? ThemePalette.Danger : ThemePalette.TextPrimary;
             });
 
@@ -416,7 +433,7 @@ namespace CastMPV.UI
         public void ApplySettings()
         {
             _player.SetHardwareAcceleration(_settings.HardwareAcceleration);
-            _player.ApplySubtitleSettings(_settings.SubtitleFontSize, _settings.SubtitleColor);
+            _player.ApplySubtitleSettings(_settings);
             if (!_player.IsPlaying)
             {
                 _lblTitle.Text = $"DLNA Ready ({_settings.DeviceName})";
@@ -439,7 +456,7 @@ namespace CastMPV.UI
                 }
 
                 _lblIdleHint.Visible = false;
-                _player.LoadMedia(request.Uri, request.Title, request.UserAgent, request.Referer);
+                _player.LoadMedia(request.Uri, request.Title, request.UserAgent, request.Referer, _settings.SubtitleDefaultDelay);
                 ShowOsd(string.IsNullOrWhiteSpace(request.Title) ? "Playing stream..." : request.Title);
             });
         }
@@ -451,7 +468,6 @@ namespace CastMPV.UI
             if (WindowState == FormWindowState.Minimized)
                 WindowState = FormWindowState.Normal;
 
-            // Brief TopMost pulse guarantees reliable foreground activation on Windows
             bool wasTopMost = TopMost;
             TopMost = true;
             Activate();
@@ -507,7 +523,7 @@ namespace CastMPV.UI
             {
                 _castSessionActive = false;
                 _lblIdleHint.Visible = false;
-                _player.LoadMedia(dlg.FileName, Path.GetFileName(dlg.FileName));
+                _player.LoadMedia(dlg.FileName, Path.GetFileName(dlg.FileName), defaultSubDelay: _settings.SubtitleDefaultDelay);
             }
         }
 
@@ -519,7 +535,7 @@ namespace CastMPV.UI
             {
                 _castSessionActive = false;
                 _lblIdleHint.Visible = false;
-                _player.LoadMedia(dlg.MediaUrl, null, dlg.CustomUserAgent, dlg.CustomReferer);
+                _player.LoadMedia(dlg.MediaUrl, null, dlg.CustomUserAgent, dlg.CustomReferer, _settings.SubtitleDefaultDelay);
             }
         }
 
@@ -607,17 +623,12 @@ namespace CastMPV.UI
         {
             var menu = CreateDarkDropdown();
             menu.Items.Add("Load External Subtitle (SRT/ASS/VTT)...", null, (_, __) => LoadSubtitleDialog());
+            menu.Items.Add("Subtitle Settings & Styling...", null, (_, __) => _openSettingsCallback?.Invoke(1));
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add($"Delay -0.5s (Current: {_player.SubtitleDelay:+0.0;-0.0;0.0}s)", null, (_, __) =>
-            {
-                _player.AdjustSubtitleDelay(-0.5);
-                ShowOsd($"Subtitle Delay: {_player.SubtitleDelay:+0.0;-0.0;0.0}s");
-            });
-            menu.Items.Add("Delay +0.5s", null, (_, __) =>
-            {
-                _player.AdjustSubtitleDelay(0.5);
-                ShowOsd($"Subtitle Delay: {_player.SubtitleDelay:+0.0;-0.0;0.0}s");
-            });
+            menu.Items.Add($"Delay -0.1s [G] (Current: {_player.SubtitleDelay:+0.0;-0.0;0.0}s)", null, (_, __) => AdjustSubDelay(-0.1));
+            menu.Items.Add("Delay +0.1s [H]", null, (_, __) => AdjustSubDelay(0.1));
+            menu.Items.Add("Delay -0.5s", null, (_, __) => AdjustSubDelay(-0.5));
+            menu.Items.Add("Delay +0.5s", null, (_, __) => AdjustSubDelay(0.5));
             menu.Items.Add("Reset Subtitle Delay", null, (_, __) =>
             {
                 _player.SetSubtitleDelay(0);
@@ -641,6 +652,12 @@ namespace CastMPV.UI
             }
 
             menu.Show(_btnSubs, new Point(0, -menu.PreferredSize.Height));
+        }
+
+        private void AdjustSubDelay(double delta)
+        {
+            _player.AdjustSubtitleDelay(delta);
+            ShowOsd($"Subtitle Delay: {_player.SubtitleDelay:+0.0;-0.0;0.0}s");
         }
 
         private static ContextMenuStrip CreateDarkDropdown() => new ContextMenuStrip
@@ -681,7 +698,7 @@ namespace CastMPV.UI
                 WindowState = FormWindowState.Normal;
                 Bounds = Screen.FromControl(this).Bounds;
 
-                _btnFullscreen.Text = "Exit";
+                _btnFullscreen.Text = "Exit Fullscreen";
                 _lastMousePos = Cursor.Position;
                 _lastMouseMoveUtc = DateTime.UtcNow;
                 _fullscreenHideTimer.Start();
@@ -699,7 +716,7 @@ namespace CastMPV.UI
                 WindowState = _savedWindowState;
                 if (_savedWindowState == FormWindowState.Normal)
                     Bounds = _savedBounds;
-                _btnFullscreen.Text = "Full";
+                _btnFullscreen.Text = "Fullscreen";
             }
         }
 
@@ -780,7 +797,7 @@ namespace CastMPV.UI
             {
                 _castSessionActive = false;
                 _lblIdleHint.Visible = false;
-                _player.LoadMedia(first, Path.GetFileName(first));
+                _player.LoadMedia(first, Path.GetFileName(first), defaultSubDelay: _settings.SubtitleDefaultDelay);
             }
         }
 
@@ -823,6 +840,14 @@ namespace CastMPV.UI
                 case Keys.M:
                     _player.ToggleMute();
                     ShowOsd(_player.IsMuted ? "Muted" : "Unmuted");
+                    e.Handled = true;
+                    break;
+                case Keys.G:
+                    AdjustSubDelay(-0.1);
+                    e.Handled = true;
+                    break;
+                case Keys.H:
+                    AdjustSubDelay(0.1);
                     e.Handled = true;
                     break;
                 case Keys.S:

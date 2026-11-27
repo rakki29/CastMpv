@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Drawing;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -104,9 +105,10 @@ namespace CastMPV.Player
             SetOption("stream-lavf-o", "reconnect=1,reconnect_streamed=1,reconnect_delay_max=5");
             SetOption("ytdl", "no");
 
-            // Subtitle defaults
-            ApplySubtitleSettings(settings.SubtitleFontSize, settings.SubtitleColor, applyToMpv: true);
+            // Full UTF-8 / Arabic RTL shaping & subtitle defaults
             SetOption("sub-auto", "fuzzy");
+            SetOption("sub-font-provider", "auto");
+            ApplySubtitleOptionsBeforeInit(settings);
 
             // Screenshot settings
             Directory.CreateDirectory(settings.ScreenshotDirectory);
@@ -123,6 +125,7 @@ namespace CastMPV.Player
             }
 
             SetVolume(settings.DefaultVolume);
+            ApplySubtitleSettings(settings);
 
             // Observe real-time properties
             Observe("time-pos", MpvFormat.Double, 1);
@@ -143,6 +146,23 @@ namespace CastMPV.Player
             return true;
         }
 
+        private void ApplySubtitleOptionsBeforeInit(AppSettings settings)
+        {
+            SetOption("sub-font", settings.SubtitleFontFamily);
+            SetOption("sub-bold", settings.SubtitleBold ? "yes" : "no");
+            SetOption("sub-font-size", settings.SubtitleFontSize.ToString(CultureInfo.InvariantCulture));
+            SetOption("sub-color", FormatMpvColor(settings.SubtitleColor, settings.SubtitleOpacity));
+            SetOption("sub-back-color", FormatMpvColor(settings.SubtitleBackColor, settings.SubtitleBackOpacity));
+            SetOption("sub-border-style", settings.SubtitleBackOpacity > 0 ? "background-box" : "outline-and-shadow");
+            SetOption("sub-border-size", settings.SubtitleBorderSize.ToString("0.##", CultureInfo.InvariantCulture));
+            SetOption("sub-border-color", FormatMpvColor(settings.SubtitleBorderColor, 100));
+            SetOption("sub-shadow-offset", settings.SubtitleShadowOffset.ToString("0.##", CultureInfo.InvariantCulture));
+            SetOption("sub-pos", settings.SubtitlePosition.ToString(CultureInfo.InvariantCulture));
+            SetOption("sub-delay", settings.SubtitleDefaultDelay.ToString("0.##", CultureInfo.InvariantCulture));
+            SetOption("sub-ass-override", settings.SubtitleAssOverride);
+            SetOption("sub-codepage", settings.SubtitleCodepage);
+        }
+
         private void SetOption(string name, string value)
         {
             if (_mpv != IntPtr.Zero)
@@ -155,7 +175,7 @@ namespace CastMPV.Player
                 MpvNative.mpv_observe_property(_mpv, id, MpvNative.ToUtf8(name), format);
         }
 
-        public void LoadMedia(string uri, string title = null, string userAgent = null, string referer = null)
+        public void LoadMedia(string uri, string title = null, string userAgent = null, string referer = null, double defaultSubDelay = 0.0)
         {
             if (string.IsNullOrWhiteSpace(uri) || !IsInitialized) return;
 
@@ -163,7 +183,7 @@ namespace CastMPV.Player
             {
                 _currentUri = uri.Trim();
                 _currentTitle = string.IsNullOrWhiteSpace(title) ? InferTitleFromUri(_currentUri) : title.Trim();
-                _subDelay = 0;
+                _subDelay = Math.Round(defaultSubDelay, 2);
 
                 if (!string.IsNullOrWhiteSpace(userAgent))
                 {
@@ -181,7 +201,7 @@ namespace CastMPV.Player
                     SetPropertyString("http-header-fields", string.Empty);
                 }
 
-                SetPropertyString("sub-delay", "0");
+                SetPropertyString("sub-delay", _subDelay.ToString("0.##", CultureInfo.InvariantCulture));
                 SetPropertyString("force-media-title", _currentTitle);
                 ExecuteCommand("loadfile", _currentUri, "replace");
                 SetPaused(false);
@@ -345,16 +365,57 @@ namespace CastMPV.Player
             }
         }
 
-        public void ApplySubtitleSettings(int fontSize, string hexColor, bool applyToMpv = true)
+        public void ApplySubtitleSettings(AppSettings settings)
         {
-            if (!IsInitialized || !applyToMpv) return;
+            if (!IsInitialized || settings == null) return;
+            settings.Normalize();
+
             lock (_sync)
             {
-                SetPropertyString("sub-font-size", fontSize.ToString(CultureInfo.InvariantCulture));
-                SetPropertyString("sub-color", string.IsNullOrWhiteSpace(hexColor) ? "#FFFFFF" : hexColor);
-                SetPropertyString("sub-border-size", "2.5");
-                SetPropertyString("sub-border-color", "#000000");
+                SetPropertyString("sub-font", settings.SubtitleFontFamily);
+                SetPropertyString("sub-bold", settings.SubtitleBold ? "yes" : "no");
+
+                double fontSize = settings.SubtitleFontSize;
+                MpvNative.mpv_set_property(_mpv, MpvNative.ToUtf8("sub-font-size"), MpvFormat.Double, ref fontSize);
+
+                SetPropertyString("sub-color", FormatMpvColor(settings.SubtitleColor, settings.SubtitleOpacity));
+                SetPropertyString("sub-back-color", FormatMpvColor(settings.SubtitleBackColor, settings.SubtitleBackOpacity));
+                SetPropertyString("sub-border-style", settings.SubtitleBackOpacity > 0 ? "background-box" : "outline-and-shadow");
+
+                double borderSize = settings.SubtitleBorderSize;
+                MpvNative.mpv_set_property(_mpv, MpvNative.ToUtf8("sub-border-size"), MpvFormat.Double, ref borderSize);
+                SetPropertyString("sub-border-color", FormatMpvColor(settings.SubtitleBorderColor, 100));
+
+                double shadow = settings.SubtitleShadowOffset;
+                MpvNative.mpv_set_property(_mpv, MpvNative.ToUtf8("sub-shadow-offset"), MpvFormat.Double, ref shadow);
+
+                long subPos = settings.SubtitlePosition;
+                MpvNative.mpv_set_property(_mpv, MpvNative.ToUtf8("sub-pos"), MpvFormat.Int64, ref subPos);
+
+                SetPropertyString("sub-ass-override", settings.SubtitleAssOverride);
+                SetPropertyString("sub-codepage", settings.SubtitleCodepage);
+
+                _subDelay = Math.Round(settings.SubtitleDefaultDelay, 2);
+                double delay = _subDelay;
+                MpvNative.mpv_set_property(_mpv, MpvNative.ToUtf8("sub-delay"), MpvFormat.Double, ref delay);
             }
+        }
+
+        public static string FormatMpvColor(string hexRgb, int opacityPercent)
+        {
+            Color c = Color.White;
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(hexRgb))
+                    c = ColorTranslator.FromHtml(hexRgb.Trim());
+            }
+            catch
+            {
+                c = Color.White;
+            }
+
+            int alpha = (int)Math.Round(Math.Max(0, Math.Min(100, opacityPercent)) / 100.0 * 255.0);
+            return $"#{alpha:X2}{c.R:X2}{c.G:X2}{c.B:X2}";
         }
 
         public List<MediaTrackInfo> GetTracks()
