@@ -13,7 +13,7 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <Version>1.0.0</Version>
     <Product>CastMPV</Product>
-    <Description>Lightweight Windows media player and DLNA Media Renderer powered by libmpv</Description>
+    <Description>Lightweight Windows media player and pure managed DLNA Media Renderer powered by libmpv</Description>
     <Deterministic>true</Deterministic>
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>
@@ -24,9 +24,9 @@
     <DefineConstants>TRACE</DefineConstants>
   </PropertyGroup>
 
+  <!-- 100% pure .NET Framework 4.8 BCL references: zero third-party UPnP or OpenSSL NuGet packages -->
   <ItemGroup>
     <Reference Include="System.Drawing" />
-    <Reference Include="System.Net.Http" />
     <Reference Include="System.Runtime.Serialization" />
     <Reference Include="System.Windows.Forms" />
     <Reference Include="System.Xml" />

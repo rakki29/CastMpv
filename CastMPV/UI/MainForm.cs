@@ -83,7 +83,7 @@ namespace CastMPV.UI
             HandleCreated += (s, e) =>
             {
                 ThemeHelper.EnableDarkTitleBar(this);
-                InitializePlayerEngine();
+                BeginInvoke(new Action(InitializePlayerEngine));
             };
         }
 
@@ -449,6 +449,7 @@ namespace CastMPV.UI
             {
                 _castSessionActive = fromDlnaCast;
                 EnsureVisibleAndFocused();
+                InitializePlayerEngine();
 
                 if (fromDlnaCast && _settings.AutoFullscreenOnCast && !_isFullscreen)
                 {

@@ -9,7 +9,6 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
-using System.Xml;
 using System.Xml.Linq;
 
 namespace CastMPV.DLNA
@@ -32,18 +31,24 @@ namespace CastMPV.DLNA
         public bool Muted { get; set; }
     }
 
+    /// <summary>
+    /// 100% pure managed C# UPnP/DLNA MediaRenderer using System.Net.HttpListener
+    /// (with automatic non-admin System.Net.Sockets.TcpListener fallback) and System.Net.Sockets.UdpClient SSDP.
+    /// Zero third-party UPnP or OpenSSL dependencies.
+    /// </summary>
     public sealed class DlnaServer : IDisposable
     {
         private const string SsdpMulticastIp = "239.255.255.250";
         private const int SsdpPort = 1900;
 
         private string _deviceName;
-        private string _deviceUuid;
-        private int _preferredPort;
+        private readonly string _deviceUuid;
+        private readonly int _preferredPort;
         private int _activePort;
         private volatile bool _running;
 
-        private TcpListener _httpListener;
+        private HttpListener _httpListener;
+        private TcpListener _socketFallbackListener;
         private Thread _httpAcceptThread;
         private UdpClient _ssdpListener;
         private Thread _ssdpReceiveThread;
@@ -97,8 +102,8 @@ namespace CastMPV.DLNA
             if (_running) return;
             _running = true;
 
-            StartHttpServer();
-            StartSsdpServer();
+            StartHttpRendererListener();
+            StartSsdpResponder();
 
             StatusChanged?.Invoke($"Running ({_deviceName} @ {GetPrimaryLanIp()}:{_activePort})");
         }
@@ -110,14 +115,45 @@ namespace CastMPV.DLNA
 
             try { SendSsdpNotify("ssdp:byebye"); } catch { }
 
-            try { _httpListener?.Stop(); } catch { }
+            try { _httpListener?.Stop(); _httpListener?.Close(); } catch { }
+            try { _socketFallbackListener?.Stop(); } catch { }
             try { _ssdpListener?.Close(); } catch { }
 
             StatusChanged?.Invoke("Stopped");
         }
 
-        private void StartHttpServer()
+        private void StartHttpRendererListener()
         {
+            // 1. Try native System.Net.HttpListener first on the configured port (+ fallback ports)
+            if (HttpListener.IsSupported)
+            {
+                for (int p = _preferredPort; p <= _preferredPort + 10; p++)
+                {
+                    var hl = new HttpListener();
+                    try
+                    {
+                        hl.Prefixes.Add($"http://+:{p}/");
+                        hl.Start();
+                        _httpListener = hl;
+                        _activePort = p;
+
+                        _httpAcceptThread = new Thread(HttpListenerAcceptLoop)
+                        {
+                            IsBackground = true,
+                            Name = "CastMPV-HttpListener"
+                        };
+                        _httpAcceptThread.Start();
+                        return;
+                    }
+                    catch
+                    {
+                        try { hl.Close(); } catch { }
+                    }
+                }
+            }
+
+            // 2. Non-admin Windows fallback: pure managed System.Net.Sockets.TcpListener
+            // (HttpListener wildcard prefixes require netsh urlacl/admin; TcpListener works for any standard user on LAN)
             Exception lastEx = null;
             for (int p = _preferredPort; p <= _preferredPort + 15; p++)
             {
@@ -126,7 +162,7 @@ namespace CastMPV.DLNA
                     var listener = new TcpListener(IPAddress.Any, p);
                     listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
                     listener.Start();
-                    _httpListener = listener;
+                    _socketFallbackListener = listener;
                     _activePort = p;
                     break;
                 }
@@ -136,25 +172,25 @@ namespace CastMPV.DLNA
                 }
             }
 
-            if (_httpListener == null)
-                throw new InvalidOperationException("Failed to bind DLNA HTTP server port.", lastEx);
+            if (_socketFallbackListener == null)
+                throw new InvalidOperationException("Failed to bind DLNA HTTP listener port.", lastEx);
 
-            _httpAcceptThread = new Thread(HttpAcceptLoop)
+            _httpAcceptThread = new Thread(SocketAcceptLoop)
             {
                 IsBackground = true,
-                Name = "CastMPV-DlnaHttp"
+                Name = "CastMPV-DlnaSocketHttp"
             };
             _httpAcceptThread.Start();
         }
 
-        private void HttpAcceptLoop()
+        private void HttpListenerAcceptLoop()
         {
-            while (_running)
+            while (_running && _httpListener != null && _httpListener.IsListening)
             {
                 try
                 {
-                    TcpClient client = _httpListener.AcceptTcpClient();
-                    ThreadPool.QueueUserWorkItem(_ => HandleHttpClient(client));
+                    HttpListenerContext ctx = _httpListener.GetContext();
+                    ThreadPool.QueueUserWorkItem(_ => HandleHttpListenerContext(ctx));
                 }
                 catch
                 {
@@ -163,7 +199,75 @@ namespace CastMPV.DLNA
             }
         }
 
-        private void HandleHttpClient(TcpClient client)
+        private void HandleHttpListenerContext(HttpListenerContext ctx)
+        {
+            try
+            {
+                HttpListenerRequest req = ctx.Request;
+                HttpListenerResponse resp = ctx.Response;
+
+                string method = req.HttpMethod?.ToUpperInvariant() ?? "GET";
+                string path = req.Url?.AbsolutePath ?? "/";
+
+                var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (string key in req.Headers.AllKeys)
+                {
+                    if (key != null) headers[key] = req.Headers[key];
+                }
+
+                string body = string.Empty;
+                if (req.HasEntityBody)
+                {
+                    using var reader = new StreamReader(req.InputStream, req.ContentEncoding ?? Encoding.UTF8);
+                    body = reader.ReadToEnd();
+                }
+
+                string hostHeader = !string.IsNullOrWhiteSpace(req.UserHostName)
+                    ? req.UserHostName
+                    : $"{GetLocalIpForRemote(req.RemoteEndPoint)}:{_activePort}";
+
+                DlnaHttpResponse result = RouteRequest(method, path, headers, body, hostHeader);
+
+                resp.StatusCode = result.StatusCode;
+                resp.StatusDescription = result.StatusReason;
+                resp.ContentType = result.ContentType;
+                if (result.ExtraHeaders != null)
+                {
+                    foreach (var kv in result.ExtraHeaders)
+                        resp.Headers[kv.Key] = kv.Value;
+                }
+
+                byte[] payload = Encoding.UTF8.GetBytes(result.Body ?? string.Empty);
+                resp.ContentLength64 = payload.Length;
+                if (method != "HEAD" && payload.Length > 0)
+                {
+                    resp.OutputStream.Write(payload, 0, payload.Length);
+                }
+                resp.OutputStream.Close();
+            }
+            catch
+            {
+                // Ignore client disconnect
+            }
+        }
+
+        private void SocketAcceptLoop()
+        {
+            while (_running && _socketFallbackListener != null)
+            {
+                try
+                {
+                    TcpClient client = _socketFallbackListener.AcceptTcpClient();
+                    ThreadPool.QueueUserWorkItem(_ => HandleSocketHttpClient(client));
+                }
+                catch
+                {
+                    if (!_running) break;
+                }
+            }
+        }
+
+        private void HandleSocketHttpClient(TcpClient client)
         {
             using (client)
             {
@@ -173,33 +277,15 @@ namespace CastMPV.DLNA
                 try
                 {
                     using NetworkStream stream = client.GetStream();
-                    if (!TryReadHttpRequest(stream, out string method, out string path, out Dictionary<string, string> headers, out string body))
+                    if (!TryReadSocketHttpRequest(stream, out string method, out string path, out Dictionary<string, string> headers, out string body))
                         return;
 
                     string hostHeader = headers.TryGetValue("host", out string h) && !string.IsNullOrWhiteSpace(h)
                         ? h
                         : $"{GetLocalIpForRemote(client.Client.RemoteEndPoint)}:{_activePort}";
 
-                    if (method == "GET" || method == "HEAD")
-                    {
-                        HandleGet(stream, method, path, headers, hostHeader);
-                    }
-                    else if (method == "POST")
-                    {
-                        HandlePost(stream, path, headers, body);
-                    }
-                    else if (method == "SUBSCRIBE")
-                    {
-                        HandleSubscribe(stream, path, headers);
-                    }
-                    else if (method == "UNSUBSCRIBE")
-                    {
-                        SendHttpResponse(stream, "200 OK", "text/plain", string.Empty);
-                    }
-                    else
-                    {
-                        SendHttpResponse(stream, "405 Method Not Allowed", "text/plain", "Method Not Allowed");
-                    }
+                    DlnaHttpResponse result = RouteRequest(method, path, headers, body, hostHeader);
+                    SendSocketHttpResponse(stream, method, result);
                 }
                 catch
                 {
@@ -208,7 +294,7 @@ namespace CastMPV.DLNA
             }
         }
 
-        private static bool TryReadHttpRequest(
+        private static bool TryReadSocketHttpRequest(
             NetworkStream stream,
             out string method,
             out string path,
@@ -278,97 +364,120 @@ namespace CastMPV.DLNA
             return true;
         }
 
-        private void HandleGet(NetworkStream stream, string method, string path, Dictionary<string, string> headers, string hostHeader)
+        private static void SendSocketHttpResponse(NetworkStream stream, string method, DlnaHttpResponse result)
         {
-            string xml = null;
-            switch (path)
+            byte[] payload = Encoding.UTF8.GetBytes(result.Body ?? string.Empty);
+            var sb = new StringBuilder();
+            sb.Append($"HTTP/1.1 {result.StatusCode} {result.StatusReason}\r\n");
+            sb.Append($"Content-Type: {result.ContentType}\r\n");
+            sb.Append($"Content-Length: {payload.Length}\r\n");
+            sb.Append("Server: Windows/10.0 UPnP/1.1 CastMPV/1.0\r\n");
+            sb.Append("Connection: close\r\n");
+            if (result.ExtraHeaders != null)
             {
-                case "/":
-                case "/description.xml":
-                    xml = BuildDeviceDescriptionXml(hostHeader);
-                    break;
-                case "/AVTransport/scpd.xml":
-                    xml = BuildAvTransportScpdXml();
-                    break;
-                case "/RenderingControl/scpd.xml":
-                    xml = BuildRenderingControlScpdXml();
-                    break;
-                case "/ConnectionManager/scpd.xml":
-                    xml = BuildConnectionManagerScpdXml();
-                    break;
+                foreach (var kv in result.ExtraHeaders)
+                    sb.Append($"{kv.Key}: {kv.Value}\r\n");
             }
+            sb.Append("\r\n");
 
-            if (xml != null)
-            {
-                SendHttpResponse(stream, "200 OK", "text/xml; charset=\"utf-8\"", method == "HEAD" ? string.Empty : xml);
-            }
-            else
-            {
-                SendHttpResponse(stream, "404 Not Found", "text/plain", "Not Found");
-            }
+            byte[] headerBytes = Encoding.ASCII.GetBytes(sb.ToString());
+            stream.Write(headerBytes, 0, headerBytes.Length);
+            if (method != "HEAD" && payload.Length > 0)
+                stream.Write(payload, 0, payload.Length);
+            stream.Flush();
         }
 
-        private void HandleSubscribe(NetworkStream stream, string path, Dictionary<string, string> headers)
+        private DlnaHttpResponse RouteRequest(
+            string method,
+            string path,
+            Dictionary<string, string> headers,
+            string body,
+            string hostHeader)
         {
-            string sid = headers.TryGetValue("sid", out string existingSid) && !string.IsNullOrWhiteSpace(existingSid)
-                ? existingSid
-                : $"uuid:{Guid.NewGuid():D}";
-
-            if (headers.TryGetValue("callback", out string cb))
-                _subscriptions[sid] = cb.Trim('<', '>');
-
-            var extraHeaders = new Dictionary<string, string>
+            if (method == "GET" || method == "HEAD")
             {
-                ["SID"] = sid,
-                ["TIMEOUT"] = "Second-1800"
-            };
-            SendHttpResponse(stream, "200 OK", "text/plain", string.Empty, extraHeaders);
-        }
+                string xml = null;
+                switch (path)
+                {
+                    case "/":
+                    case "/description.xml":
+                        xml = BuildDeviceDescriptionXml(hostHeader);
+                        break;
+                    case "/AVTransport/scpd.xml":
+                        xml = BuildAvTransportScpdXml();
+                        break;
+                    case "/RenderingControl/scpd.xml":
+                        xml = BuildRenderingControlScpdXml();
+                        break;
+                    case "/ConnectionManager/scpd.xml":
+                        xml = BuildConnectionManagerScpdXml();
+                        break;
+                }
 
-        private void HandlePost(NetworkStream stream, string path, Dictionary<string, string> headers, string body)
-        {
-            string soapAction = headers.TryGetValue("soapaction", out string sa) ? sa.Trim('"', ' ') : string.Empty;
-            string actionName = soapAction.Contains("#") ? soapAction.Substring(soapAction.IndexOf('#') + 1) : string.Empty;
+                if (xml != null)
+                    return new DlnaHttpResponse(200, "OK", "text/xml; charset=\"utf-8\"", xml);
 
-            XDocument doc;
-            try
-            {
-                doc = XDocument.Parse(body);
-            }
-            catch
-            {
-                SendSoapFault(stream, 402, "Invalid XML");
-                return;
+                return new DlnaHttpResponse(404, "Not Found", "text/plain", "Not Found");
             }
 
-            if (string.IsNullOrEmpty(actionName))
+            if (method == "POST")
             {
-                XElement bodyEl = doc.Root?.Elements().FirstOrDefault(e => e.Name.LocalName == "Body");
-                actionName = bodyEl?.Elements().FirstOrDefault()?.Name.LocalName ?? string.Empty;
+                string soapAction = headers.TryGetValue("soapaction", out string sa) ? sa.Trim('"', ' ') : string.Empty;
+                string actionName = soapAction.Contains("#") ? soapAction.Substring(soapAction.IndexOf('#') + 1) : string.Empty;
+
+                XDocument doc;
+                try
+                {
+                    doc = XDocument.Parse(body);
+                }
+                catch
+                {
+                    return SoapFaultResponse(402, "Invalid XML");
+                }
+
+                if (string.IsNullOrEmpty(actionName))
+                {
+                    XElement bodyEl = doc.Root?.Elements().FirstOrDefault(e => e.Name.LocalName == "Body");
+                    actionName = bodyEl?.Elements().FirstOrDefault()?.Name.LocalName ?? string.Empty;
+                }
+
+                string responseXml = null;
+                if (path.Equals("/AVTransport/control", StringComparison.OrdinalIgnoreCase))
+                    responseXml = ProcessAvTransportAction(actionName, doc);
+                else if (path.Equals("/RenderingControl/control", StringComparison.OrdinalIgnoreCase))
+                    responseXml = ProcessRenderingControlAction(actionName, doc);
+                else if (path.Equals("/ConnectionManager/control", StringComparison.OrdinalIgnoreCase))
+                    responseXml = ProcessConnectionManagerAction(actionName);
+
+                if (responseXml != null)
+                    return new DlnaHttpResponse(200, "OK", "text/xml; charset=\"utf-8\"", responseXml);
+
+                return SoapFaultResponse(401, "Invalid Action");
             }
 
-            string responseXml = null;
-            if (path.Equals("/AVTransport/control", StringComparison.OrdinalIgnoreCase))
+            if (method == "SUBSCRIBE")
             {
-                responseXml = ProcessAvTransportAction(actionName, doc);
-            }
-            else if (path.Equals("/RenderingControl/control", StringComparison.OrdinalIgnoreCase))
-            {
-                responseXml = ProcessRenderingControlAction(actionName, doc);
-            }
-            else if (path.Equals("/ConnectionManager/control", StringComparison.OrdinalIgnoreCase))
-            {
-                responseXml = ProcessConnectionManagerAction(actionName);
+                string sid = headers.TryGetValue("sid", out string existingSid) && !string.IsNullOrWhiteSpace(existingSid)
+                    ? existingSid
+                    : $"uuid:{Guid.NewGuid():D}";
+
+                if (headers.TryGetValue("callback", out string cb))
+                    _subscriptions[sid] = cb.Trim('<', '>');
+
+                var extraHeaders = new Dictionary<string, string>
+                {
+                    ["SID"] = sid,
+                    ["TIMEOUT"] = "Second-1800"
+                };
+                return new DlnaHttpResponse(200, "OK", "text/plain", string.Empty, extraHeaders);
             }
 
-            if (responseXml != null)
+            if (method == "UNSUBSCRIBE")
             {
-                SendHttpResponse(stream, "200 OK", "text/xml; charset=\"utf-8\"", responseXml);
+                return new DlnaHttpResponse(200, "OK", "text/plain", string.Empty);
             }
-            else
-            {
-                SendSoapFault(stream, 401, "Invalid Action");
-            }
+
+            return new DlnaHttpResponse(405, "Method Not Allowed", "text/plain", "Method Not Allowed");
         }
 
         private string ProcessAvTransportAction(string action, XDocument doc)
@@ -402,27 +511,19 @@ namespace CastMPV.DLNA
                 case "Play":
                 {
                     if (!string.IsNullOrWhiteSpace(_currentUri) && snap.TransportState == "STOPPED")
-                    {
                         CastMediaRequested?.Invoke(ParseCastRequest(_currentUri, _currentMetadata));
-                    }
                     else
-                    {
                         PlayRequested?.Invoke();
-                    }
                     return WrapSoapResponse(ns, action, string.Empty);
                 }
 
                 case "Pause":
-                {
                     PauseRequested?.Invoke();
                     return WrapSoapResponse(ns, action, string.Empty);
-                }
 
                 case "Stop":
-                {
                     StopRequested?.Invoke();
                     return WrapSoapResponse(ns, action, string.Empty);
-                }
 
                 case "Seek":
                 {
@@ -476,27 +577,13 @@ namespace CastMPV.DLNA
                 }
 
                 case "GetDeviceCapabilities":
-                {
-                    const string inner =
-                        "<PlayMedia>NETWORK</PlayMedia>" +
-                        "<RecMedia>NOT_IMPLEMENTED</RecMedia>" +
-                        "<RecQualityModes>NOT_IMPLEMENTED</RecQualityModes>";
-                    return WrapSoapResponse(ns, action, inner);
-                }
+                    return WrapSoapResponse(ns, action, "<PlayMedia>NETWORK</PlayMedia><RecMedia>NOT_IMPLEMENTED</RecMedia><RecQualityModes>NOT_IMPLEMENTED</RecQualityModes>");
 
                 case "GetTransportSettings":
-                {
-                    const string inner =
-                        "<PlayMode>NORMAL</PlayMode>" +
-                        "<RecQualityMode>NOT_IMPLEMENTED</RecQualityMode>";
-                    return WrapSoapResponse(ns, action, inner);
-                }
+                    return WrapSoapResponse(ns, action, "<PlayMode>NORMAL</PlayMode><RecQualityMode>NOT_IMPLEMENTED</RecQualityMode>");
 
                 case "GetCurrentTransportActions":
-                {
-                    const string inner = "<Actions>Play,Pause,Stop,Seek</Actions>";
-                    return WrapSoapResponse(ns, action, inner);
-                }
+                    return WrapSoapResponse(ns, action, "<Actions>Play,Pause,Stop,Seek</Actions>");
 
                 default:
                     return null;
@@ -560,11 +647,10 @@ namespace CastMPV.DLNA
                     return WrapSoapResponse(ns, action, "<ConnectionIDs>0</ConnectionIDs>");
 
                 case "GetCurrentConnectionInfo":
-                    const string info =
+                    return WrapSoapResponse(ns, action,
                         "<RcsID>0</RcsID><AVTransportID>0</AVTransportID>" +
                         "<ProtocolInfo></ProtocolInfo><PeerConnectionManager></PeerConnectionManager>" +
-                        "<PeerConnectionID>-1</PeerConnectionID><Direction>Input</Direction><Status>OK</Status>";
-                    return WrapSoapResponse(ns, action, info);
+                        "<PeerConnectionID>-1</PeerConnectionID><Direction>Input</Direction><Status>OK</Status>");
 
                 default:
                     return null;
@@ -577,7 +663,6 @@ namespace CastMPV.DLNA
             string userAgent = null;
             string referer = null;
 
-            // Support optional Kodi/IPTV pipe suffix: url|User-Agent=...&Referer=...
             int pipeIdx = uri.IndexOf('|');
             if (pipeIdx > 0)
             {
@@ -603,10 +688,7 @@ namespace CastMPV.DLNA
                     var didl = XDocument.Parse(decodedMeta);
                     title = didl.Descendants().FirstOrDefault(e => e.Name.LocalName == "title")?.Value;
                 }
-                catch
-                {
-                    // Ignore malformed DIDL-Lite metadata
-                }
+                catch { }
             }
 
             return new CastMediaRequest
@@ -618,7 +700,7 @@ namespace CastMPV.DLNA
             };
         }
 
-        private void StartSsdpServer()
+        private void StartSsdpResponder()
         {
             _ssdpListener = new UdpClient(AddressFamily.InterNetwork);
             _ssdpListener.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
@@ -631,10 +713,7 @@ namespace CastMPV.DLNA
                 {
                     _ssdpListener.JoinMulticastGroup(multicastAddr, localIp);
                 }
-                catch
-                {
-                    // Ignore interfaces that fail multicast join
-                }
+                catch { }
             }
 
             _ssdpReceiveThread = new Thread(SsdpReceiveLoop)
@@ -662,9 +741,7 @@ namespace CastMPV.DLNA
                     byte[] data = _ssdpListener.Receive(ref remoteEp);
                     string msg = Encoding.UTF8.GetString(data);
                     if (msg.StartsWith("M-SEARCH", StringComparison.OrdinalIgnoreCase))
-                    {
                         HandleMSearch(msg, remoteEp);
-                    }
                 }
                 catch
                 {
@@ -764,27 +841,31 @@ namespace CastMPV.DLNA
             var multicastEp = new IPEndPoint(IPAddress.Parse(SsdpMulticastIp), SsdpPort);
             foreach (IPAddress localIp in GetLocalIPv4Addresses())
             {
-                string location = $"http://{localIp}:{_activePort}/description.xml";
-                using var sender = new UdpClient(new IPEndPoint(localIp, 0));
-                foreach (string nt in notificationTypes)
+                try
                 {
-                    string usn = nt.StartsWith("uuid:", StringComparison.OrdinalIgnoreCase)
-                        ? $"uuid:{_deviceUuid}"
-                        : $"uuid:{_deviceUuid}::{nt}";
+                    string location = $"http://{localIp}:{_activePort}/description.xml";
+                    using var sender = new UdpClient(new IPEndPoint(localIp, 0));
+                    foreach (string nt in notificationTypes)
+                    {
+                        string usn = nt.StartsWith("uuid:", StringComparison.OrdinalIgnoreCase)
+                            ? $"uuid:{_deviceUuid}"
+                            : $"uuid:{_deviceUuid}::{nt}";
 
-                    string notify =
-                        "NOTIFY * HTTP/1.1\r\n" +
-                        $"HOST: {SsdpMulticastIp}:{SsdpPort}\r\n" +
-                        "CACHE-CONTROL: max-age=1800\r\n" +
-                        $"LOCATION: {location}\r\n" +
-                        $"NT: {nt}\r\n" +
-                        $"NTS: {nts}\r\n" +
-                        "SERVER: Windows/10.0 UPnP/1.1 CastMPV/1.0\r\n" +
-                        $"USN: {usn}\r\n\r\n";
+                        string notify =
+                            "NOTIFY * HTTP/1.1\r\n" +
+                            $"HOST: {SsdpMulticastIp}:{SsdpPort}\r\n" +
+                            "CACHE-CONTROL: max-age=1800\r\n" +
+                            $"LOCATION: {location}\r\n" +
+                            $"NT: {nt}\r\n" +
+                            $"NTS: {nts}\r\n" +
+                            "SERVER: Windows/10.0 UPnP/1.1 CastMPV/1.0\r\n" +
+                            $"USN: {usn}\r\n\r\n";
 
-                    byte[] bytes = Encoding.UTF8.GetBytes(notify);
-                    try { sender.Send(bytes, bytes.Length, multicastEp); } catch { }
+                        byte[] bytes = Encoding.UTF8.GetBytes(notify);
+                        sender.Send(bytes, bytes.Length, multicastEp);
+                    }
                 }
+                catch { }
             }
         }
 
@@ -954,7 +1035,7 @@ namespace CastMPV.DLNA
                 "</s:Body></s:Envelope>";
         }
 
-        private static void SendSoapFault(NetworkStream stream, int code, string desc)
+        private static DlnaHttpResponse SoapFaultResponse(int code, string desc)
         {
             string xml =
                 "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
@@ -962,35 +1043,7 @@ namespace CastMPV.DLNA
                 "<s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring>" +
                 $"<detail><UPnPError xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>{code}</errorCode><errorDescription>{EscapeXml(desc)}</errorDescription></UPnPError></detail>" +
                 "</s:Fault></s:Body></s:Envelope>";
-            SendHttpResponse(stream, "500 Internal Server Error", "text/xml; charset=\"utf-8\"", xml);
-        }
-
-        private static void SendHttpResponse(
-            NetworkStream stream,
-            string status,
-            string contentType,
-            string body,
-            Dictionary<string, string> extraHeaders = null)
-        {
-            byte[] payload = Encoding.UTF8.GetBytes(body ?? string.Empty);
-            var sb = new StringBuilder();
-            sb.Append($"HTTP/1.1 {status}\r\n");
-            sb.Append($"Content-Type: {contentType}\r\n");
-            sb.Append($"Content-Length: {payload.Length}\r\n");
-            sb.Append("Server: Windows/10.0 UPnP/1.1 CastMPV/1.0\r\n");
-            sb.Append("Connection: close\r\n");
-            if (extraHeaders != null)
-            {
-                foreach (var kv in extraHeaders)
-                    sb.Append($"{kv.Key}: {kv.Value}\r\n");
-            }
-            sb.Append("\r\n");
-
-            byte[] headerBytes = Encoding.ASCII.GetBytes(sb.ToString());
-            stream.Write(headerBytes, 0, headerBytes.Length);
-            if (payload.Length > 0)
-                stream.Write(payload, 0, payload.Length);
-            stream.Flush();
+            return new DlnaHttpResponse(500, "Internal Server Error", "text/xml; charset=\"utf-8\"", xml);
         }
 
         private static string GetXmlElementValue(XDocument doc, string localName)
@@ -1066,6 +1119,29 @@ namespace CastMPV.DLNA
         public void Dispose()
         {
             Stop();
+        }
+
+        private sealed class DlnaHttpResponse
+        {
+            public int StatusCode { get; }
+            public string StatusReason { get; }
+            public string ContentType { get; }
+            public string Body { get; }
+            public Dictionary<string, string> ExtraHeaders { get; }
+
+            public DlnaHttpResponse(
+                int statusCode,
+                string statusReason,
+                string contentType,
+                string body,
+                Dictionary<string, string> extraHeaders = null)
+            {
+                StatusCode = statusCode;
+                StatusReason = statusReason;
+                ContentType = contentType;
+                Body = body;
+                ExtraHeaders = extraHeaders;
+            }
         }
     }
 }

@@ -110,7 +110,7 @@ export const PROJECT_FILES: ProjectFileEntry[] = [
     path: 'CastMPV/DLNA/DlnaServer.cs',
     category: 'DLNA Renderer',
     language: 'csharp',
-    summary: 'Zero-admin TcpListener UPnP HTTP/1.1 + SSDP multicast server for AVTransport, RenderingControl, ConnectionManager.',
+    summary: '100% pure managed C# System.Net.HttpListener (with TcpListener fallback) + System.Net.Sockets SSDP responder; zero OpenSSL.',
     content: dlnaServerCs,
   },
   {

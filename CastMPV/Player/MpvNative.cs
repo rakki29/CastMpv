@@ -79,15 +79,29 @@ namespace CastMPV.Player
     internal static class MpvNative
     {
         private const string DllName = "libmpv-2.dll";
+        private const uint LOAD_WITH_ALTERED_SEARCH_PATH = 0x00000008;
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern IntPtr LoadLibrary(string lpFileName);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern bool SetDllDirectory(string lpPathName);
+        private static extern IntPtr LoadLibraryEx(string lpFileName, IntPtr hReservedNull, uint dwFlags);
 
         public static bool EnsureLibraryLoaded(out string errorMessage)
         {
+            // Prevent external system OpenSSL env vars (e.g., from Git/Perl/OpenVPN)
+            // from interfering with internal TLS/crypto inside libmpv-2.dll.
+            try
+            {
+                Environment.SetEnvironmentVariable("OPENSSL_CONF", null);
+                Environment.SetEnvironmentVariable("OPENSSL_MODULES", null);
+                Environment.SetEnvironmentVariable("OPENSSL_ENGINES", null);
+            }
+            catch
+            {
+                // Ignore if restricted
+            }
+
             string baseDir = AppDomain.CurrentDomain.BaseDirectory;
             string archDir = Environment.Is64BitProcess ? "x64" : "x86";
             string[] candidates =
@@ -101,8 +115,10 @@ namespace CastMPV.Player
             {
                 if (File.Exists(path))
                 {
-                    SetDllDirectory(Path.GetDirectoryName(path));
-                    IntPtr h = LoadLibrary(path);
+                    IntPtr h = LoadLibraryEx(path, IntPtr.Zero, LOAD_WITH_ALTERED_SEARCH_PATH);
+                    if (h == IntPtr.Zero)
+                        h = LoadLibrary(path);
+
                     if (h != IntPtr.Zero)
                     {
                         errorMessage = null;
