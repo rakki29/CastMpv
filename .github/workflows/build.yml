@@ -1,0 +1,128 @@
+name: Build CastMPV Windows Releases (x86 & x64)
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Windows ${{ matrix.arch }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            mpv_pattern: "mpv-dev-x86_64-*.7z"
+          - arch: x86
+            mpv_pattern: "mpv-dev-i686-*.7z"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Download latest libmpv (${{ matrix.arch }}) from shinchiro/mpv-winbuild-cmake
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ 'User-Agent' = 'CastMPV-CI' }
+          if ($env:GITHUB_TOKEN) {
+            $headers['Authorization'] = "Bearer $env:GITHUB_TOKEN"
+          }
+
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest" -Headers $headers
+          $pattern = "${{ matrix.mpv_pattern }}"
+          $asset = $release.assets | Where-Object { $_.name -like $pattern -and $_.name -notlike "*v3*" } | Select-Object -First 1
+          if (-not $asset) {
+            $asset = $release.assets | Where-Object { $_.name -like $pattern } | Select-Object -First 1
+          }
+          if (-not $asset) {
+            throw "Could not find matching libmpv asset for pattern $pattern"
+          }
+
+          Write-Host "Downloading $($asset.name) ($([math]::Round($asset.size / 1MB, 2)) MB)..."
+          $archivePath = Join-Path $env:RUNNER_TEMP $asset.name
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archivePath
+
+          $extractDir = Join-Path $env:RUNNER_TEMP "mpv-extract-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+          7z x $archivePath "-o$extractDir" -y | Out-Null
+
+          $dll = Get-ChildItem -Path $extractDir -Recurse -Filter "libmpv-2.dll" | Select-Object -First 1
+          if (-not $dll) {
+            $dll = Get-ChildItem -Path $extractDir -Recurse -Filter "mpv-2.dll" | Select-Object -First 1
+          }
+          if (-not $dll) {
+            throw "libmpv-2.dll not found inside $($asset.name)"
+          }
+
+          $nativeDir = "CastMPV/native/${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force -Path $nativeDir | Out-Null
+          Copy-Item $dll.FullName -Destination (Join-Path $nativeDir "libmpv-2.dll") -Force
+          Write-Host "Copied libmpv-2.dll ($([math]::Round($dll.Length / 1MB, 2)) MB) to $nativeDir"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build CastMPV (${{ matrix.arch }})
+        run: |
+          dotnet build CastMPV/CastMPV.csproj -c Release -p:Platform=${{ matrix.arch }} -o dist/CastMPV-win-${{ matrix.arch }}
+
+      - name: Verify compact package footprint and stage release archive
+        shell: pwsh
+        run: |
+          $distDir = "dist/CastMPV-win-${{ matrix.arch }}"
+          if (-not (Test-Path "$distDir/CastMPV.exe")) { throw "CastMPV.exe missing!" }
+          if (-not (Test-Path "$distDir/libmpv-2.dll")) { throw "libmpv-2.dll missing!" }
+
+          # Remove XML documentation/PDB clutter if any to keep footprint minimal
+          Get-ChildItem -Path $distDir -Include *.pdb,*.xml -Recurse | Remove-Item -Force
+
+          Copy-Item "CastMPV/README.md" -Destination "$distDir/README.txt" -Force
+
+          $totalBytes = (Get-ChildItem -Path $distDir -Recurse | Measure-Object -Property Length -Sum).Sum
+          $totalMB = [math]::Round($totalBytes / 1MB, 2)
+          Write-Host "Uncompressed package size (${{ matrix.arch }}): $totalMB MB"
+
+          New-Item -ItemType Directory -Force -Path "release-zips" | Out-Null
+          $zipPath = "release-zips/CastMPV-win-${{ matrix.arch }}.zip"
+          Compress-Archive -Path "$distDir/*" -DestinationPath $zipPath -CompressionLevel Optimal -Force
+          $zipMB = [math]::Round((Get-Item $zipPath).Length / 1MB, 2)
+          Write-Host "Compressed release zip (${{ matrix.arch }}): $zipMB MB"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CastMPV-win-${{ matrix.arch }}
+          path: release-zips/CastMPV-win-${{ matrix.arch }}.zip
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

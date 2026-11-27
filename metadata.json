@@ -1,0 +1,6 @@
+{
+  "name": "CastMPV — Windows Media Player & DLNA Renderer",
+  "description": "Complete C# (.NET Framework 4.8) + libmpv Windows desktop media player and zero-touch DLNA/UPnP Media Renderer with GitHub Actions x86/x64 build pipeline.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
