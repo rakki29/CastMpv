@@ -15,17 +15,16 @@ jobs:
   build:
     name: Build Windows ${{ matrix.arch }}
     runs-on: windows-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x64
             mpv_pattern: "mpv-dev-x86_64-*.7z"
-            sf_arch: "x86_64"
             pe_machine: 34404
           - arch: x86
             mpv_pattern: "mpv-dev-i686-*.7z"
-            sf_arch: "i686"
             pe_machine: 332
 
     steps:
@@ -48,14 +47,13 @@ jobs:
 
           $arch = "${{ matrix.arch }}"
           $pattern = "${{ matrix.mpv_pattern }}"
-          $sfArch = "${{ matrix.sf_arch }}"
           $expectedMachine = [int]${{ matrix.pe_machine }}
 
           $nativeDir = "CastMPV/native/$arch"
           if (Test-Path $nativeDir) { Remove-Item -Recurse -Force $nativeDir }
           New-Item -ItemType Directory -Force -Path $nativeDir | Out-Null
 
-          # Create a native smoke-test executable that mirrors CastMPV's MpvNative isolation & MTA init
+          # Build fast native smoke-test executable mirroring CastMPV's MpvNative isolation & MTA init
           $probeDir = Join-Path $env:RUNNER_TEMP "mpv-probe-$arch"
           New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
           $probeOut = Join-Path $probeDir "out"
@@ -173,7 +171,7 @@ jobs:
           }
           $probeExe = Join-Path $probeOut "MpvProbe.exe"
           if (-not (Test-Path $probeExe)) {
-            throw "MpvProbe.exe was not found at $probeExe"
+            throw "MpvProbe.exe missing at $probeExe"
           }
 
           function Get-PeMachine([string]$FilePath) {
@@ -199,21 +197,22 @@ jobs:
           function Test-MpvArchive([string]$Label, [string]$Url, [string]$ArchiveName) {
             if (-not $seenUrls.Add($Url)) { return $false }
 
-            Write-Host "Testing [$Label] -> $ArchiveName..."
+            Write-Host "Downloading [$Label] -> $ArchiveName..."
             $archivePath = Join-Path $env:RUNNER_TEMP $ArchiveName
             if (Test-Path $archivePath) { Remove-Item -Force $archivePath -ErrorAction SilentlyContinue }
 
-            & curl.exe -fsSL --retry 3 --max-time 180 -A "CastMPV-CI" -o $archivePath $Url
+            & curl.exe -fsSL --connect-timeout 15 --max-time 60 -A "CastMPV-CI" -o $archivePath $Url
             if ($LASTEXITCODE -ne 0 -or -not (Test-Path $archivePath) -or (Get-Item $archivePath).Length -lt 100KB) {
-              Write-Warning "Download failed or incomplete for $Url"
+              Write-Warning "Download failed or timed out for $Url"
               return $false
             }
 
             if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
             New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+
             & 7z x $archivePath "-o$extractDir" -y | Out-Null
             if ($LASTEXITCODE -ne 0) {
-              Write-Warning "7z extraction failed for $ArchiveName"
+              Write-Warning "Extraction failed for $ArchiveName"
               return $false
             }
 
@@ -223,11 +222,20 @@ jobs:
               return $false
             }
 
-            $dlls = Get-ChildItem -Path $extractDir -Recurse -Filter "libmpv-2.dll"
+            # Support both libmpv-2.dll and mpv-2.dll (identical ABI; copy mpv-2.dll -> libmpv-2.dll)
+            $dlls = @(Get-ChildItem -Path $extractDir -Recurse -Filter "libmpv-2.dll")
+            if ($dlls.Count -eq 0) {
+              $altDlls = @(Get-ChildItem -Path $extractDir -Recurse -Filter "mpv-2.dll")
+              foreach ($alt in $altDlls) {
+                $targetPath = Join-Path $alt.DirectoryName "libmpv-2.dll"
+                Copy-Item $alt.FullName -Destination $targetPath -Force
+                $dlls += Get-Item $targetPath
+              }
+            }
+
             $dll = $null
             foreach ($candidate in $dlls) {
-              $machine = Get-PeMachine $candidate.FullName
-              if ($machine -eq $expectedMachine) {
+              if ((Get-PeMachine $candidate.FullName) -eq $expectedMachine) {
                 $dll = $candidate
                 break
               }
@@ -243,9 +251,9 @@ jobs:
             }
 
             $proc = Start-Process -FilePath $probeExe -WorkingDirectory $probeOut -PassThru -NoNewWindow
-            if (-not $proc.WaitForExit(15000)) {
+            if (-not $proc.WaitForExit(10000)) {
               try { $proc.Kill() } catch {}
-              Write-Warning "$ArchiveName timed out during Windows smoke test; trying next candidate..."
+              Write-Warning "$ArchiveName timed out during Windows smoke test."
               return $false
             }
 
@@ -257,148 +265,62 @@ jobs:
               return $true
             }
 
-            Write-Warning "$ArchiveName failed Windows smoke test (exit code $($proc.ExitCode)); trying next candidate..."
+            Write-Warning "$ArchiveName failed smoke test (exit code $($proc.ExitCode)); trying next candidate..."
             return $false
-          }
-
-          function Select-PreferredAsset($Assets) {
-            $asset = $Assets | Where-Object { $_.name -like $pattern -and ($_.name -like "*schannel*" -or $_.name -like "*gnutls*") } | Select-Object -First 1
-            if (-not $asset) {
-              $asset = $Assets | Where-Object { $_.name -like $pattern -and $_.name -notlike "*v3*" } | Select-Object -First 1
-            }
-            if (-not $asset) {
-              $asset = $Assets | Where-Object { $_.name -like $pattern } | Select-Object -First 1
-            }
-            return $asset
           }
 
           $verified = $false
 
-          # Source 1: shinchiro/mpv-winbuild-cmake GitHub Releases (deep multi-page sampling)
-          Write-Host "Checking shinchiro/mpv-winbuild-cmake GitHub releases..."
-          for ($page = 1; $page -le 6 -and -not $verified; $page++) {
-            try {
-              $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases?per_page=100&page=$page" -Headers $headers
-            } catch {
-              Write-Warning "GitHub API error on shinchiro page ${page}: $($_.Exception.Message)"
-              break
-            }
-            if (-not $releases -or $releases.Count -eq 0) { break }
-
-            $indices = New-Object 'System.Collections.Generic.List[int]'
-            if ($arch -eq "x64" -and $page -eq 1) {
-              for ($i = 0; $i -lt [Math]::Min(10, $releases.Count); $i++) { $indices.Add($i) }
-            } else {
-              if ($page -eq 1) {
-                $indices.Add(0)
-                if ($releases.Count -gt 1) { $indices.Add(1) }
-                for ($i = 10; $i -lt $releases.Count; $i += 10) { $indices.Add($i) }
-              } else {
-                for ($i = 0; $i -lt $releases.Count; $i += 15) { $indices.Add($i) }
-              }
-            }
-
-            foreach ($idx in $indices) {
-              $rel = $releases[$idx]
-              $asset = Select-PreferredAsset $rel.assets
-              if (-not $asset) { continue }
-              if (Test-MpvArchive "shinchiro/$($rel.tag_name)" $asset.browser_download_url $asset.name) {
-                $verified = $true
-                break
-              }
-            }
+          if ($arch -eq "x86") {
+            # Fast primary for x86: direct GitHub raw CDN GnuTLS/SChannel build (zero OpenSSL)
+            $verified = Test-MpvArchive `
+              "SubtitleEdit/support-files" `
+              "https://raw.githubusercontent.com/SubtitleEdit/support-files/master/mpv/libmpv2-32.zip" `
+              "libmpv2-32.zip"
           }
 
-          # Source 2: SourceForge mpv-player-windows /libmpv archive (multi-year monthly sampling)
           if (-not $verified) {
-            Write-Host "Checking SourceForge mpv-player-windows /libmpv archive..."
-            $sfCandidates = New-Object 'System.Collections.Generic.List[string]'
-            foreach ($sfUrl in @(
-              "https://sourceforge.net/projects/mpv-player-windows/rss?path=/libmpv",
-              "https://sourceforge.net/projects/mpv-player-windows/files/libmpv/"
-            )) {
-              try {
-                $body = & curl.exe -fsSL --retry 2 --max-time 60 -A "CastMPV-CI" $sfUrl
-                if ($LASTEXITCODE -eq 0 -and $body) {
-                  $regexMatches = [regex]::Matches($body, "mpv-dev-$sfArch-(\d{8})-git-[A-Za-z0-9]+\.7z")
-                  foreach ($m in $regexMatches) {
-                    if (-not $sfCandidates.Contains($m.Value)) { $sfCandidates.Add($m.Value) }
-                  }
-                }
-              } catch {
-                Write-Warning "SourceForge query failed for ${sfUrl}: $($_.Exception.Message)"
-              }
-            }
-
-            if ($sfArch -eq "i686" -and -not $sfCandidates.Contains("mpv-dev-i686-20250105-git-996e58a.7z")) {
-              $sfCandidates.Add("mpv-dev-i686-20250105-git-996e58a.7z")
-            }
-
-            $byMonth = @{}
-            foreach ($fn in $sfCandidates) {
-              if ($fn -match "(\d{6})\d{2}") {
-                $ym = $Matches[1]
-                if (-not $byMonth.ContainsKey($ym) -or $fn -gt $byMonth[$ym]) {
-                  $byMonth[$ym] = $fn
-                }
-              }
-            }
-
-            $orderedMonths = $byMonth.Keys | Sort-Object -Descending
-            foreach ($ym in $orderedMonths) {
-              $fn = $byMonth[$ym]
-              $dlUrl = "https://sourceforge.net/projects/mpv-player-windows/files/libmpv/$fn/download"
-              if (Test-MpvArchive "SourceForge/$ym" $dlUrl $fn) {
-                $verified = $true
-                break
-              }
-            }
-          }
-
-          # Source 3: SubtitleEdit/support-files (Windows .NET WinForms libmpv builds)
-          if (-not $verified) {
-            Write-Host "Checking SubtitleEdit/support-files..."
+            # Fast GitHub Releases check (latest 2 releases only, strict 15s API timeout)
             try {
-              $seItems = Invoke-RestMethod -Uri "https://api.github.com/repos/SubtitleEdit/support-files/contents/mpv" -Headers $headers
-              foreach ($item in $seItems) {
-                if ($item.type -ne "file") { continue }
-                if ($item.name -notmatch "\.(7z|zip)$") { continue }
-                if ($arch -eq "x86" -and $item.name -match "64|arm") { continue }
-                if ($arch -eq "x64" -and $item.name -match "32|x86[^_]|i686") { continue }
-                if (Test-MpvArchive "SubtitleEdit/support-files" $item.download_url $item.name) {
+              $releases = Invoke-RestMethod `
+                -Uri "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases?per_page=2" `
+                -Headers $headers `
+                -TimeoutSec 15
+
+              foreach ($rel in $releases) {
+                $asset = $rel.assets | Where-Object { $_.name -like $pattern -and ($_.name -like "*schannel*" -or $_.name -like "*gnutls*") } | Select-Object -First 1
+                if (-not $asset) {
+                  $asset = $rel.assets | Where-Object { $_.name -like $pattern -and $_.name -notlike "*v3*" } | Select-Object -First 1
+                }
+                if (-not $asset) { continue }
+                if (Test-MpvArchive "shinchiro/$($rel.tag_name)" $asset.browser_download_url $asset.name) {
                   $verified = $true
                   break
                 }
               }
             } catch {
-              Write-Warning "SubtitleEdit/support-files check failed: $($_.Exception.Message)"
+              Write-Warning "shinchiro GitHub API check failed: $($_.Exception.Message)"
             }
           }
 
-          # Source 4: media-kit/libmpv-win32-video-build GitHub releases
-          if (-not $verified) {
-            Write-Host "Checking media-kit/libmpv-win32-video-build..."
-            try {
-              $mkReleases = Invoke-RestMethod -Uri "https://api.github.com/repos/media-kit/libmpv-win32-video-build/releases?per_page=10" -Headers $headers
-              foreach ($rel in $mkReleases) {
-                foreach ($asset in $rel.assets) {
-                  if ($asset.name -notmatch "\.(7z|zip)$") { continue }
-                  if ($arch -eq "x86" -and $asset.name -match "x86_64|x64|win64|arm64") { continue }
-                  if ($arch -eq "x64" -and $asset.name -notmatch "x86_64|x64|win64") { continue }
-                  if (Test-MpvArchive "media-kit/$($rel.tag_name)" $asset.browser_download_url $asset.name) {
-                    $verified = $true
-                    break
-                  }
-                }
-                if ($verified) { break }
-              }
-            } catch {
-              Write-Warning "media-kit check failed: $($_.Exception.Message)"
+          if (-not $verified -and $arch -eq "x64") {
+            # Fast CDN fallback 1 for x64: SubtitleEdit GnuTLS/SChannel build
+            $verified = Test-MpvArchive `
+              "SubtitleEdit/support-files" `
+              "https://raw.githubusercontent.com/SubtitleEdit/support-files/master/mpv/libmpv2-64.zip" `
+              "libmpv2-64.zip"
+
+            # Fast NuGet fallback 2 for x64: Endpne.LibMPV.Windows
+            if (-not $verified) {
+              $verified = Test-MpvArchive `
+                "NuGet/Endpne.LibMPV.Windows" `
+                "https://api.nuget.org/v3-flatcontainer/endpne.libmpv.windows/0.41.0/endpne.libmpv.windows.0.41.0.nupkg" `
+                "endpne.libmpv.windows.0.41.0.zip"
             }
           }
 
           if (-not $verified) {
-            throw "Failed to find a verified clean libmpv-2.dll build for $arch"
+            throw "Failed to obtain a verified clean libmpv-2.dll build for $arch"
           }
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -438,6 +360,7 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4

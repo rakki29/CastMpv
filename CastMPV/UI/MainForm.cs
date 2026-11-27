@@ -502,7 +502,7 @@ namespace CastMPV.UI
 
             Task.Run(async () =>
             {
-                bool anyLoaded = false;
+                bool anyQueued = false;
                 for (int i = 0; i < urls.Count; i++)
                 {
                     string subUrl = urls[i];
@@ -514,15 +514,17 @@ namespace CastMPV.UI
                     catch { }
 
                     string trackToLoad = !string.IsNullOrWhiteSpace(cachedPath) ? cachedPath : subUrl;
+                    bool showBanner = !anyQueued;
+                    anyQueued = true;
+
                     BeginUi(() =>
                     {
                         if (!string.Equals(_player.CurrentUri, expectedUri, StringComparison.OrdinalIgnoreCase))
                             return;
 
                         _player.AddExternalSubtitle(trackToLoad);
-                        if (!anyLoaded)
+                        if (showBanner)
                         {
-                            anyLoaded = true;
                             ShowOsd(!string.IsNullOrWhiteSpace(cachedPath)
                                 ? $"DLNA Subtitle loaded: {Path.GetFileName(cachedPath)}"
                                 : "DLNA Subtitle attached");
@@ -530,7 +532,7 @@ namespace CastMPV.UI
                     });
                 }
 
-                if (!anyLoaded && _settings.AutoDetectLocalSubtitles)
+                if (!anyQueued && _settings.AutoDetectLocalSubtitles)
                 {
                     BeginUi(() => AutoDetectAndApplySubtitle(expectedUri, title, showMissingOsd: false));
                 }

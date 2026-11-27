@@ -16,6 +16,7 @@ namespace CastMPV.UI
         public static readonly Color AccentHover = Color.FromArgb(14, 165, 233);
         public static readonly Color TextPrimary = Color.FromArgb(241, 245, 249);
         public static readonly Color TextMuted = Color.FromArgb(148, 163, 184);
+        public static readonly Color Success = Color.FromArgb(34, 197, 94);
         public static readonly Color Danger = Color.FromArgb(239, 68, 68);
     }
 
