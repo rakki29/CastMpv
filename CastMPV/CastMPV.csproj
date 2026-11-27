@@ -33,11 +33,11 @@
     <Reference Include="System.Xml.Linq" />
   </ItemGroup>
 
-  <!-- Copy libmpv-2.dll if present in native/$(Platform) during build -->
+  <!-- Copy libmpv-2.dll and any verified non-OpenSSL companion DLLs if present in native/$(Platform) during build -->
   <ItemGroup Condition="Exists('native\$(Platform)\libmpv-2.dll')">
-    <None Include="native\$(Platform)\libmpv-2.dll">
+    <None Include="native\$(Platform)\*.dll">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Link>libmpv-2.dll</Link>
+      <Link>%(Filename)%(Extension)</Link>
     </None>
   </ItemGroup>
 

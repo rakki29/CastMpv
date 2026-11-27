@@ -21,8 +21,12 @@ jobs:
         include:
           - arch: x64
             mpv_pattern: "mpv-dev-x86_64-*.7z"
+            sf_arch: "x86_64"
+            pe_machine: 34404
           - arch: x86
             mpv_pattern: "mpv-dev-i686-*.7z"
+            sf_arch: "i686"
+            pe_machine: 332
 
     steps:
       - name: Checkout repository
@@ -33,7 +37,7 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Download & verify clean static libmpv-2.dll (${{ matrix.arch }})
+      - name: Download & verify clean libmpv-2.dll (${{ matrix.arch }})
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -42,13 +46,17 @@ jobs:
             $headers['Authorization'] = "Bearer $env:GITHUB_TOKEN"
           }
 
-          $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases?per_page=10" -Headers $headers
+          $arch = "${{ matrix.arch }}"
           $pattern = "${{ matrix.mpv_pattern }}"
-          $nativeDir = "CastMPV/native/${{ matrix.arch }}"
+          $sfArch = "${{ matrix.sf_arch }}"
+          $expectedMachine = [int]${{ matrix.pe_machine }}
+
+          $nativeDir = "CastMPV/native/$arch"
+          if (Test-Path $nativeDir) { Remove-Item -Recurse -Force $nativeDir }
           New-Item -ItemType Directory -Force -Path $nativeDir | Out-Null
 
-          # Create a lightweight native smoke-test project to verify mpv_create + mpv_initialize on Windows
-          $probeDir = Join-Path $env:RUNNER_TEMP "mpv-probe-${{ matrix.arch }}"
+          # Create a native smoke-test executable that mirrors CastMPV's MpvNative isolation & MTA init
+          $probeDir = Join-Path $env:RUNNER_TEMP "mpv-probe-$arch"
           New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
           $probeOut = Join-Path $probeDir "out"
           New-Item -ItemType Directory -Force -Path $probeOut | Out-Null
@@ -67,32 +75,99 @@ jobs:
 
           @'
           using System;
+          using System.IO;
           using System.Runtime.InteropServices;
           using System.Text;
+          using System.Threading;
+
           class Program {
+              private const uint LOAD_WITH_ALTERED_SEARCH_PATH = 0x00000008;
+              private const uint LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR = 0x00000100;
+              private const uint LOAD_LIBRARY_SEARCH_APPLICATION_DIR = 0x00000200;
+              private const uint LOAD_LIBRARY_SEARCH_USER_DIRS = 0x00000400;
+              private const uint LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800;
+              private const uint LOAD_LIBRARY_SEARCH_DEFAULT_DIRS = 0x00001000;
+
               [DllImport("kernel32.dll")] static extern uint SetErrorMode(uint uMode);
+              [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetDefaultDllDirectories(uint flags);
+              [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr AddDllDirectory(string dir);
+              [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr LoadLibraryEx(string fileName, IntPtr reserved, uint flags);
+              [DllImport("msvcrt.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)] static extern IntPtr setlocale(int cat, string loc);
+              [DllImport("msvcrt.dll", EntryPoint = "_putenv", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)] static extern int msvcrt_putenv(string s);
+              [DllImport("ucrtbase.dll", EntryPoint = "_putenv", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)] static extern int ucrtbase_putenv(string s);
+
               [DllImport("libmpv-2.dll", CallingConvention = CallingConvention.Cdecl)] static extern IntPtr mpv_create();
               [DllImport("libmpv-2.dll", CallingConvention = CallingConvention.Cdecl)] static extern int mpv_set_option_string(IntPtr ctx, byte[] name, byte[] val);
               [DllImport("libmpv-2.dll", CallingConvention = CallingConvention.Cdecl)] static extern int mpv_initialize(IntPtr ctx);
+              [DllImport("libmpv-2.dll", CallingConvention = CallingConvention.Cdecl)] static extern IntPtr mpv_get_property_string(IntPtr ctx, byte[] name);
+              [DllImport("libmpv-2.dll", CallingConvention = CallingConvention.Cdecl)] static extern void mpv_free(IntPtr data);
               [DllImport("libmpv-2.dll", CallingConvention = CallingConvention.Cdecl)] static extern void mpv_terminate_destroy(IntPtr ctx);
+
               static byte[] U(string s) => Encoding.UTF8.GetBytes(s + "\0");
+              static string FromUtf8(IntPtr p) {
+                  if (p == IntPtr.Zero) return null;
+                  int len = 0;
+                  while (Marshal.ReadByte(p, len) != 0) len++;
+                  if (len == 0) return string.Empty;
+                  byte[] b = new byte[len];
+                  Marshal.Copy(p, b, 0, len);
+                  return Encoding.UTF8.GetString(b);
+              }
+
               static int Main() {
                   SetErrorMode(0x0001 | 0x0002 | 0x8000);
-                  Environment.SetEnvironmentVariable("OPENSSL_CONF", null);
-                  Environment.SetEnvironmentVariable("OPENSSL_MODULES", null);
-                  IntPtr ctx = mpv_create();
-                  if (ctx == IntPtr.Zero) return 2;
-                  mpv_set_option_string(ctx, U("vo"), U("null"));
-                  mpv_set_option_string(ctx, U("ao"), U("null"));
-                  mpv_set_option_string(ctx, U("ytdl"), U("no"));
-                  int rc = mpv_initialize(ctx);
-                  mpv_terminate_destroy(ctx);
-                  return rc < 0 ? 3 : 0;
+                  string[] vars = {
+                      "OPENSSL_CONF", "OPENSSL_MODULES", "OPENSSL_ENGINES",
+                      "OPENSSL_FORCE_FIPS_MODE", "OPENSSL_WIN32_UTF8", "RANDFILE",
+                      "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE"
+                  };
+                  foreach (string v in vars) {
+                      try { Environment.SetEnvironmentVariable(v, null); } catch {}
+                      try { msvcrt_putenv(v + "="); } catch {}
+                      try { ucrtbase_putenv(v + "="); } catch {}
+                  }
+                  try { setlocale(4, "C"); } catch {}
+
+                  string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                  try {
+                      SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_USER_DIRS | LOAD_LIBRARY_SEARCH_SYSTEM32);
+                      AddDllDirectory(baseDir);
+                  } catch {}
+
+                  string dllPath = Path.Combine(baseDir, "libmpv-2.dll");
+                  IntPtr h = LoadLibraryEx(dllPath, IntPtr.Zero, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+                  if (h == IntPtr.Zero) h = LoadLibraryEx(dllPath, IntPtr.Zero, LOAD_WITH_ALTERED_SEARCH_PATH);
+                  if (h == IntPtr.Zero) return 4;
+
+                  int exitCode = 3;
+                  var t = new Thread(() => {
+                      try { setlocale(4, "C"); } catch {}
+                      IntPtr ctx = mpv_create();
+                      if (ctx == IntPtr.Zero) { exitCode = 2; return; }
+                      mpv_set_option_string(ctx, U("vo"), U("null"));
+                      mpv_set_option_string(ctx, U("ao"), U("null"));
+                      mpv_set_option_string(ctx, U("ytdl"), U("no"));
+                      int rc = mpv_initialize(ctx);
+                      if (rc >= 0) {
+                          IntPtr verPtr = mpv_get_property_string(ctx, U("mpv-version"));
+                          string ver = FromUtf8(verPtr);
+                          if (verPtr != IntPtr.Zero) mpv_free(verPtr);
+                          if (!string.IsNullOrEmpty(ver)) Console.WriteLine("MpvProbe verified: " + ver);
+                          exitCode = 0;
+                      } else {
+                          exitCode = 5;
+                      }
+                      mpv_terminate_destroy(ctx);
+                  });
+                  t.SetApartmentState(ApartmentState.MTA);
+                  t.Start();
+                  t.Join();
+                  return exitCode;
               }
           }
           '@ | Set-Content (Join-Path $probeDir "Program.cs")
 
-          dotnet build (Join-Path $probeDir "MpvProbe.csproj") -c Release -p:Platform=${{ matrix.arch }} -o $probeOut
+          dotnet build (Join-Path $probeDir "MpvProbe.csproj") -c Release -p:Platform=$arch -o $probeOut
           if ($LASTEXITCODE -ne 0) {
             throw "MpvProbe build failed with exit code $LASTEXITCODE"
           }
@@ -101,57 +176,229 @@ jobs:
             throw "MpvProbe.exe was not found at $probeExe"
           }
 
-          $verified = $false
-          foreach ($rel in $releases) {
-            # Prefer Schannel/GnuTLS variants if tagged, otherwise standard static mpv-dev archive (non-v3)
-            $asset = $rel.assets | Where-Object { $_.name -like $pattern -and ($_.name -like "*schannel*" -or $_.name -like "*gnutls*") } | Select-Object -First 1
-            if (-not $asset) {
-              $asset = $rel.assets | Where-Object { $_.name -like $pattern -and $_.name -notlike "*v3*" } | Select-Object -First 1
+          function Get-PeMachine([string]$FilePath) {
+            $fs = [System.IO.File]::OpenRead($FilePath)
+            try {
+              $br = New-Object System.IO.BinaryReader($fs)
+              if ($fs.Length -lt 64) { return 0 }
+              if ($br.ReadUInt16() -ne 0x5A4D) { return 0 }
+              $fs.Position = 0x3C
+              $peOffset = $br.ReadInt32()
+              if ($peOffset -le 0 -or ($peOffset + 6) -gt $fs.Length) { return 0 }
+              $fs.Position = $peOffset
+              if ($br.ReadUInt32() -ne 0x00004550) { return 0 }
+              return [int]$br.ReadUInt16()
+            } finally {
+              $fs.Dispose()
             }
-            if (-not $asset) {
-              $asset = $rel.assets | Where-Object { $_.name -like $pattern } | Select-Object -First 1
+          }
+
+          $seenUrls = New-Object 'System.Collections.Generic.HashSet[string]'
+          $extractDir = Join-Path $env:RUNNER_TEMP "mpv-extract-$arch"
+
+          function Test-MpvArchive([string]$Label, [string]$Url, [string]$ArchiveName) {
+            if (-not $seenUrls.Add($Url)) { return $false }
+
+            Write-Host "Testing [$Label] -> $ArchiveName..."
+            $archivePath = Join-Path $env:RUNNER_TEMP $ArchiveName
+            if (Test-Path $archivePath) { Remove-Item -Force $archivePath -ErrorAction SilentlyContinue }
+
+            & curl.exe -fsSL --retry 3 --max-time 180 -A "CastMPV-CI" -o $archivePath $Url
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $archivePath) -or (Get-Item $archivePath).Length -lt 100KB) {
+              Write-Warning "Download failed or incomplete for $Url"
+              return $false
             }
-            if (-not $asset) { continue }
 
-            Write-Host "Testing $($rel.tag_name) -> $($asset.name)..."
-            $archivePath = Join-Path $env:RUNNER_TEMP $asset.name
-            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archivePath
-
-            $extractDir = Join-Path $env:RUNNER_TEMP "mpv-extract-${{ matrix.arch }}"
             if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
             New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
-            7z x $archivePath "-o$extractDir" -y | Out-Null
-
-            $dll = Get-ChildItem -Path $extractDir -Recurse -Filter "libmpv-2.dll" | Select-Object -First 1
-            if (-not $dll) { continue }
-
-            # Verify no external libcrypto/libssl DLL dependencies exist in the archive
-            $externalSsl = Get-ChildItem -Path $extractDir -Recurse -Include "libcrypto*.dll","libssl*.dll"
-            if ($externalSsl) {
-              Write-Host "Skipping $($asset.name): contains external OpenSSL DLLs."
-              continue
+            & 7z x $archivePath "-o$extractDir" -y | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "7z extraction failed for $ArchiveName"
+              return $false
             }
 
-            # Live Windows smoke test (mpv_create + mpv_initialize) with 15s timeout
-            Copy-Item $dll.FullName -Destination (Join-Path $probeOut "libmpv-2.dll") -Force
+            $externalSsl = Get-ChildItem -Path $extractDir -Recurse -Include "libcrypto*.dll","libssl*.dll"
+            if ($externalSsl) {
+              Write-Host "Skipping ${ArchiveName}: contains external OpenSSL DLLs."
+              return $false
+            }
+
+            $dlls = Get-ChildItem -Path $extractDir -Recurse -Filter "libmpv-2.dll"
+            $dll = $null
+            foreach ($candidate in $dlls) {
+              $machine = Get-PeMachine $candidate.FullName
+              if ($machine -eq $expectedMachine) {
+                $dll = $candidate
+                break
+              }
+            }
+            if (-not $dll) {
+              Write-Host "Skipping ${ArchiveName}: no matching $arch libmpv-2.dll found."
+              return $false
+            }
+
+            Get-ChildItem -Path $probeOut -Filter "*.dll" | Remove-Item -Force -ErrorAction SilentlyContinue
+            Get-ChildItem -Path $dll.DirectoryName -Filter "*.dll" | ForEach-Object {
+              Copy-Item $_.FullName -Destination (Join-Path $probeOut $_.Name) -Force
+            }
+
             $proc = Start-Process -FilePath $probeExe -WorkingDirectory $probeOut -PassThru -NoNewWindow
             if (-not $proc.WaitForExit(15000)) {
               try { $proc.Kill() } catch {}
-              Write-Warning "$($asset.name) timed out during Windows smoke test; trying previous release..."
-              continue
+              Write-Warning "$ArchiveName timed out during Windows smoke test; trying next candidate..."
+              return $false
             }
+
             if ($proc.ExitCode -eq 0) {
-              Copy-Item $dll.FullName -Destination (Join-Path $nativeDir "libmpv-2.dll") -Force
-              Write-Host "Verified clean libmpv-2.dll ($([math]::Round($dll.Length / 1MB, 2)) MB) from $($rel.tag_name)"
-              $verified = $true
+              Get-ChildItem -Path $dll.DirectoryName -Filter "*.dll" | ForEach-Object {
+                Copy-Item $_.FullName -Destination (Join-Path $nativeDir $_.Name) -Force
+              }
+              Write-Host "Verified clean libmpv-2.dll ($([math]::Round($dll.Length / 1MB, 2)) MB) from $Label ($ArchiveName)"
+              return $true
+            }
+
+            Write-Warning "$ArchiveName failed Windows smoke test (exit code $($proc.ExitCode)); trying next candidate..."
+            return $false
+          }
+
+          function Select-PreferredAsset($Assets) {
+            $asset = $Assets | Where-Object { $_.name -like $pattern -and ($_.name -like "*schannel*" -or $_.name -like "*gnutls*") } | Select-Object -First 1
+            if (-not $asset) {
+              $asset = $Assets | Where-Object { $_.name -like $pattern -and $_.name -notlike "*v3*" } | Select-Object -First 1
+            }
+            if (-not $asset) {
+              $asset = $Assets | Where-Object { $_.name -like $pattern } | Select-Object -First 1
+            }
+            return $asset
+          }
+
+          $verified = $false
+
+          # Source 1: shinchiro/mpv-winbuild-cmake GitHub Releases (deep multi-page sampling)
+          Write-Host "Checking shinchiro/mpv-winbuild-cmake GitHub releases..."
+          for ($page = 1; $page -le 6 -and -not $verified; $page++) {
+            try {
+              $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases?per_page=100&page=$page" -Headers $headers
+            } catch {
+              Write-Warning "GitHub API error on shinchiro page ${page}: $($_.Exception.Message)"
               break
+            }
+            if (-not $releases -or $releases.Count -eq 0) { break }
+
+            $indices = New-Object 'System.Collections.Generic.List[int]'
+            if ($arch -eq "x64" -and $page -eq 1) {
+              for ($i = 0; $i -lt [Math]::Min(10, $releases.Count); $i++) { $indices.Add($i) }
             } else {
-              Write-Warning "$($asset.name) failed Windows smoke test (exit code $($proc.ExitCode)); trying previous release..."
+              if ($page -eq 1) {
+                $indices.Add(0)
+                if ($releases.Count -gt 1) { $indices.Add(1) }
+                for ($i = 10; $i -lt $releases.Count; $i += 10) { $indices.Add($i) }
+              } else {
+                for ($i = 0; $i -lt $releases.Count; $i += 15) { $indices.Add($i) }
+              }
+            }
+
+            foreach ($idx in $indices) {
+              $rel = $releases[$idx]
+              $asset = Select-PreferredAsset $rel.assets
+              if (-not $asset) { continue }
+              if (Test-MpvArchive "shinchiro/$($rel.tag_name)" $asset.browser_download_url $asset.name) {
+                $verified = $true
+                break
+              }
+            }
+          }
+
+          # Source 2: SourceForge mpv-player-windows /libmpv archive (multi-year monthly sampling)
+          if (-not $verified) {
+            Write-Host "Checking SourceForge mpv-player-windows /libmpv archive..."
+            $sfCandidates = New-Object 'System.Collections.Generic.List[string]'
+            foreach ($sfUrl in @(
+              "https://sourceforge.net/projects/mpv-player-windows/rss?path=/libmpv",
+              "https://sourceforge.net/projects/mpv-player-windows/files/libmpv/"
+            )) {
+              try {
+                $body = & curl.exe -fsSL --retry 2 --max-time 60 -A "CastMPV-CI" $sfUrl
+                if ($LASTEXITCODE -eq 0 -and $body) {
+                  $regexMatches = [regex]::Matches($body, "mpv-dev-$sfArch-(\d{8})-git-[A-Za-z0-9]+\.7z")
+                  foreach ($m in $regexMatches) {
+                    if (-not $sfCandidates.Contains($m.Value)) { $sfCandidates.Add($m.Value) }
+                  }
+                }
+              } catch {
+                Write-Warning "SourceForge query failed for ${sfUrl}: $($_.Exception.Message)"
+              }
+            }
+
+            if ($sfArch -eq "i686" -and -not $sfCandidates.Contains("mpv-dev-i686-20250105-git-996e58a.7z")) {
+              $sfCandidates.Add("mpv-dev-i686-20250105-git-996e58a.7z")
+            }
+
+            $byMonth = @{}
+            foreach ($fn in $sfCandidates) {
+              if ($fn -match "(\d{6})\d{2}") {
+                $ym = $Matches[1]
+                if (-not $byMonth.ContainsKey($ym) -or $fn -gt $byMonth[$ym]) {
+                  $byMonth[$ym] = $fn
+                }
+              }
+            }
+
+            $orderedMonths = $byMonth.Keys | Sort-Object -Descending
+            foreach ($ym in $orderedMonths) {
+              $fn = $byMonth[$ym]
+              $dlUrl = "https://sourceforge.net/projects/mpv-player-windows/files/libmpv/$fn/download"
+              if (Test-MpvArchive "SourceForge/$ym" $dlUrl $fn) {
+                $verified = $true
+                break
+              }
+            }
+          }
+
+          # Source 3: SubtitleEdit/support-files (Windows .NET WinForms libmpv builds)
+          if (-not $verified) {
+            Write-Host "Checking SubtitleEdit/support-files..."
+            try {
+              $seItems = Invoke-RestMethod -Uri "https://api.github.com/repos/SubtitleEdit/support-files/contents/mpv" -Headers $headers
+              foreach ($item in $seItems) {
+                if ($item.type -ne "file") { continue }
+                if ($item.name -notmatch "\.(7z|zip)$") { continue }
+                if ($arch -eq "x86" -and $item.name -match "64|arm") { continue }
+                if ($arch -eq "x64" -and $item.name -match "32|x86[^_]|i686") { continue }
+                if (Test-MpvArchive "SubtitleEdit/support-files" $item.download_url $item.name) {
+                  $verified = $true
+                  break
+                }
+              }
+            } catch {
+              Write-Warning "SubtitleEdit/support-files check failed: $($_.Exception.Message)"
+            }
+          }
+
+          # Source 4: media-kit/libmpv-win32-video-build GitHub releases
+          if (-not $verified) {
+            Write-Host "Checking media-kit/libmpv-win32-video-build..."
+            try {
+              $mkReleases = Invoke-RestMethod -Uri "https://api.github.com/repos/media-kit/libmpv-win32-video-build/releases?per_page=10" -Headers $headers
+              foreach ($rel in $mkReleases) {
+                foreach ($asset in $rel.assets) {
+                  if ($asset.name -notmatch "\.(7z|zip)$") { continue }
+                  if ($arch -eq "x86" -and $asset.name -match "x86_64|x64|win64|arm64") { continue }
+                  if ($arch -eq "x64" -and $asset.name -notmatch "x86_64|x64|win64") { continue }
+                  if (Test-MpvArchive "media-kit/$($rel.tag_name)" $asset.browser_download_url $asset.name) {
+                    $verified = $true
+                    break
+                  }
+                }
+                if ($verified) { break }
+              }
+            } catch {
+              Write-Warning "media-kit check failed: $($_.Exception.Message)"
             }
           }
 
           if (-not $verified) {
-            throw "Failed to find a verified libmpv-2.dll build for ${{ matrix.arch }}"
+            throw "Failed to find a verified clean libmpv-2.dll build for $arch"
           }
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

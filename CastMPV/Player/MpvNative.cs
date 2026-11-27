@@ -81,9 +81,11 @@ namespace CastMPV.Player
     {
         private const string DllName = "libmpv-2.dll";
         private const uint LOAD_WITH_ALTERED_SEARCH_PATH = 0x00000008;
+        private const uint LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR = 0x00000100;
         private const uint LOAD_LIBRARY_SEARCH_APPLICATION_DIR = 0x00000200;
         private const uint LOAD_LIBRARY_SEARCH_USER_DIRS = 0x00000400;
         private const uint LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800;
+        private const uint LOAD_LIBRARY_SEARCH_DEFAULT_DIRS = 0x00001000;
         private const int LC_NUMERIC = 4;
 
         private static readonly object _initLock = new object();
@@ -108,10 +110,17 @@ namespace CastMPV.Player
         [DllImport("msvcrt.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
         private static extern IntPtr setlocale(int category, string locale);
 
+        [DllImport("msvcrt.dll", EntryPoint = "_putenv", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+        private static extern int msvcrt_putenv(string envstring);
+
+        [DllImport("ucrtbase.dll", EntryPoint = "_putenv", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+        private static extern int ucrtbase_putenv(string envstring);
+
         public static void IsolateProcessEnvironment()
         {
             // Clear OpenSSL/TLS environment variables inherited from system tools
-            // (Git, Strawberry Perl, OpenVPN, Python, etc.) before loading libmpv-2.dll.
+            // (Git, Strawberry Perl, OpenVPN, Python, etc.) in both Win32 PEB and CRT tables
+            // before loading libmpv-2.dll.
             string[] varsToClear =
             {
                 "OPENSSL_CONF",
@@ -128,6 +137,8 @@ namespace CastMPV.Player
             foreach (string varName in varsToClear)
             {
                 try { Environment.SetEnvironmentVariable(varName, null); } catch { }
+                try { msvcrt_putenv(varName + "="); } catch { }
+                try { ucrtbase_putenv(varName + "="); } catch { }
             }
 
             // libmpv requires CRT LC_NUMERIC to be "C"
@@ -187,7 +198,14 @@ namespace CastMPV.Player
                     string dir = Path.GetDirectoryName(path);
                     IsolateDllDirectory(dir);
 
-                    IntPtr h = LoadLibraryEx(path, IntPtr.Zero, LOAD_WITH_ALTERED_SEARCH_PATH);
+                    IntPtr h = LoadLibraryEx(
+                        path,
+                        IntPtr.Zero,
+                        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+
+                    if (h == IntPtr.Zero)
+                        h = LoadLibraryEx(path, IntPtr.Zero, LOAD_WITH_ALTERED_SEARCH_PATH);
+
                     if (h == IntPtr.Zero)
                         h = LoadLibrary(path);
 
