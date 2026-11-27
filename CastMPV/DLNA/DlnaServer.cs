@@ -19,6 +19,7 @@ namespace CastMPV.DLNA
         public string Title { get; set; }
         public string UserAgent { get; set; }
         public string Referer { get; set; }
+        public List<string> SubtitleUrls { get; set; } = new List<string>();
     }
 
     public sealed class PlaybackSnapshot
@@ -57,6 +58,7 @@ namespace CastMPV.DLNA
 
         private string _currentUri = string.Empty;
         private string _currentMetadata = string.Empty;
+        private Dictionary<string, string> _currentHeaders = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private string _nextUri = string.Empty;
 
         public event Action<CastMediaRequest> CastMediaRequested;
@@ -443,7 +445,7 @@ namespace CastMPV.DLNA
 
                 string responseXml = null;
                 if (path.Equals("/AVTransport/control", StringComparison.OrdinalIgnoreCase))
-                    responseXml = ProcessAvTransportAction(actionName, doc);
+                    responseXml = ProcessAvTransportAction(actionName, doc, headers);
                 else if (path.Equals("/RenderingControl/control", StringComparison.OrdinalIgnoreCase))
                     responseXml = ProcessRenderingControlAction(actionName, doc);
                 else if (path.Equals("/ConnectionManager/control", StringComparison.OrdinalIgnoreCase))
@@ -480,7 +482,7 @@ namespace CastMPV.DLNA
             return new DlnaHttpResponse(405, "Method Not Allowed", "text/plain", "Method Not Allowed");
         }
 
-        private string ProcessAvTransportAction(string action, XDocument doc)
+        private string ProcessAvTransportAction(string action, XDocument doc, Dictionary<string, string> headers)
         {
             const string ns = "urn:schemas-upnp-org:service:AVTransport:1";
             PlaybackSnapshot snap = GetPlaybackSnapshot?.Invoke() ?? new PlaybackSnapshot();
@@ -493,10 +495,11 @@ namespace CastMPV.DLNA
                     string metadata = GetXmlElementValue(doc, "CurrentURIMetaData");
                     _currentUri = rawUri ?? string.Empty;
                     _currentMetadata = metadata ?? string.Empty;
+                    _currentHeaders = headers ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
                     if (!string.IsNullOrWhiteSpace(_currentUri))
                     {
-                        CastMediaRequest req = ParseCastRequest(_currentUri, _currentMetadata);
+                        CastMediaRequest req = ParseCastRequest(_currentUri, _currentMetadata, _currentHeaders);
                         CastMediaRequested?.Invoke(req);
                     }
                     return WrapSoapResponse(ns, action, string.Empty);
@@ -511,7 +514,7 @@ namespace CastMPV.DLNA
                 case "Play":
                 {
                     if (!string.IsNullOrWhiteSpace(_currentUri) && snap.TransportState == "STOPPED")
-                        CastMediaRequested?.Invoke(ParseCastRequest(_currentUri, _currentMetadata));
+                        CastMediaRequested?.Invoke(ParseCastRequest(_currentUri, _currentMetadata, _currentHeaders));
                     else
                         PlayRequested?.Invoke();
                     return WrapSoapResponse(ns, action, string.Empty);
@@ -639,6 +642,12 @@ namespace CastMPV.DLNA
                         "http-get:*:audio/mpeg:*," +
                         "http-get:*:audio/flac:*," +
                         "http-get:*:audio/mp4:*," +
+                        "http-get:*:text/srt:*," +
+                        "http-get:*:text/vtt:*," +
+                        "http-get:*:text/x-ass:*," +
+                        "http-get:*:text/x-ssa:*," +
+                        "http-get:*:application/x-subrip:*," +
+                        "http-get:*:smi/caption:*," +
                         "http-get:*:*:*";
                     return WrapSoapResponse(ns, action, $"<Source></Source><Sink>{EscapeXml(sink)}</Sink>");
                 }
@@ -657,11 +666,28 @@ namespace CastMPV.DLNA
             }
         }
 
-        private static CastMediaRequest ParseCastRequest(string rawUri, string metadata)
+        private static CastMediaRequest ParseCastRequest(
+            string rawUri,
+            string metadata,
+            Dictionary<string, string> requestHeaders)
         {
             string uri = WebUtility.HtmlDecode(rawUri).Trim();
             string userAgent = null;
             string referer = null;
+            var subtitleUrls = new List<string>();
+            var seenSubUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            void AddSubtitleCandidate(string candidate)
+            {
+                if (string.IsNullOrWhiteSpace(candidate)) return;
+                string decoded = WebUtility.HtmlDecode(candidate).Trim();
+                if (Uri.TryCreate(decoded, UriKind.Absolute, out Uri subUri) &&
+                    (subUri.Scheme == Uri.UriSchemeHttp || subUri.Scheme == Uri.UriSchemeHttps))
+                {
+                    if (!decoded.Equals(uri, StringComparison.OrdinalIgnoreCase) && seenSubUrls.Add(decoded))
+                        subtitleUrls.Add(decoded);
+                }
+            }
 
             int pipeIdx = uri.IndexOf('|');
             if (pipeIdx > 0)
@@ -676,7 +702,21 @@ namespace CastMPV.DLNA
                     string val = Uri.UnescapeDataString(pair.Substring(eq + 1).Trim());
                     if (key.Equals("User-Agent", StringComparison.OrdinalIgnoreCase)) userAgent = val;
                     else if (key.Equals("Referer", StringComparison.OrdinalIgnoreCase)) referer = val;
+                    else if (key.Equals("Subtitle", StringComparison.OrdinalIgnoreCase) ||
+                             key.Equals("Sub", StringComparison.OrdinalIgnoreCase) ||
+                             key.Equals("Caption", StringComparison.OrdinalIgnoreCase))
+                    {
+                        AddSubtitleCandidate(val);
+                    }
                 }
+            }
+
+            if (requestHeaders != null)
+            {
+                if (requestHeaders.TryGetValue("CaptionInfo.sec", out string captionHeader))
+                    AddSubtitleCandidate(captionHeader);
+                if (requestHeaders.TryGetValue("X-Subtitle-URL", out string customSubHeader))
+                    AddSubtitleCandidate(customSubHeader);
             }
 
             string title = null;
@@ -684,9 +724,39 @@ namespace CastMPV.DLNA
             {
                 try
                 {
-                    string decodedMeta = metadata.TrimStart().StartsWith("&lt;") ? WebUtility.HtmlDecode(metadata) : metadata;
+                    string decodedMeta = metadata;
+                    for (int pass = 0; pass < 2 && decodedMeta.TrimStart().StartsWith("&lt;", StringComparison.OrdinalIgnoreCase); pass++)
+                        decodedMeta = WebUtility.HtmlDecode(decodedMeta);
+
                     var didl = XDocument.Parse(decodedMeta);
                     title = didl.Descendants().FirstOrDefault(e => e.Name.LocalName == "title")?.Value;
+
+                    // Intercept Samsung CaptionInfoEx/CaptionInfo, PacketVideo subtitleFileUri, and custom subtitle tags
+                    string[] subTagNames = { "CaptionInfoEx", "CaptionInfo", "subtitleFileUri", "subtitle", "subtitles", "captionInfo", "track" };
+                    foreach (XElement el in didl.Descendants())
+                    {
+                        string local = el.Name.LocalName;
+                        if (subTagNames.Any(tag => local.Equals(tag, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            AddSubtitleCandidate(el.Value);
+                            foreach (XAttribute attr in el.Attributes())
+                            {
+                                if (attr.Name.LocalName.Equals("src", StringComparison.OrdinalIgnoreCase) ||
+                                    attr.Name.LocalName.Equals("uri", StringComparison.OrdinalIgnoreCase) ||
+                                    attr.Name.LocalName.Equals("url", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    AddSubtitleCandidate(attr.Value);
+                                }
+                            }
+                        }
+                        else if (local.Equals("res", StringComparison.OrdinalIgnoreCase))
+                        {
+                            string proto = el.Attribute("protocolInfo")?.Value ?? string.Empty;
+                            string resVal = el.Value?.Trim() ?? string.Empty;
+                            if (IsSubtitleProtocolOrUrl(proto, resVal))
+                                AddSubtitleCandidate(resVal);
+                        }
+                    }
                 }
                 catch { }
             }
@@ -696,8 +766,26 @@ namespace CastMPV.DLNA
                 Uri = uri,
                 Title = title,
                 UserAgent = userAgent,
-                Referer = referer
+                Referer = referer,
+                SubtitleUrls = subtitleUrls
             };
+        }
+
+        private static bool IsSubtitleProtocolOrUrl(string protocolInfo, string url)
+        {
+            string p = protocolInfo?.ToLowerInvariant() ?? string.Empty;
+            if (p.Contains("text/srt") || p.Contains("text/vtt") || p.Contains("subrip") ||
+                p.Contains("text/x-ass") || p.Contains("text/x-ssa") || p.Contains("smi/caption") ||
+                p.Contains("ttml") || p.Contains("subtitle"))
+            {
+                return true;
+            }
+
+            string clean = url?.ToLowerInvariant() ?? string.Empty;
+            int q = clean.IndexOf('?');
+            if (q >= 0) clean = clean.Substring(0, q);
+            return clean.EndsWith(".srt") || clean.EndsWith(".vtt") || clean.EndsWith(".ass") ||
+                   clean.EndsWith(".ssa") || clean.EndsWith(".sub") || clean.EndsWith(".smi");
         }
 
         private void StartSsdpResponder()

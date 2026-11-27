@@ -83,6 +83,15 @@ namespace CastMPV.Core
         public string SubtitleCodepage { get; set; } = "auto";
 
         [DataMember]
+        public bool AutoDetectLocalSubtitles { get; set; } = true;
+
+        [DataMember]
+        public string OpenSubtitlesApiKey { get; set; } = string.Empty;
+
+        [DataMember]
+        public string OpenSubtitlesLanguage { get; set; } = "en";
+
+        [DataMember]
         public string DefaultUserAgent { get; set; } = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 
         [DataMember]
@@ -157,6 +166,10 @@ namespace CastMPV.Core
                 SubtitleAssOverride = "yes";
             if (string.IsNullOrWhiteSpace(SubtitleCodepage))
                 SubtitleCodepage = "auto";
+            if (string.IsNullOrWhiteSpace(OpenSubtitlesLanguage))
+                OpenSubtitlesLanguage = "en";
+            if (OpenSubtitlesApiKey == null)
+                OpenSubtitlesApiKey = string.Empty;
 
             if (string.IsNullOrWhiteSpace(ScreenshotDirectory))
                 ScreenshotDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "CastMPV");

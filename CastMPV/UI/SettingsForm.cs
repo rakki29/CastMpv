@@ -51,6 +51,9 @@ namespace CastMPV.UI
         private NumericUpDown _numSubDelay;
         private ComboBox _cmbAssOverride;
         private ComboBox _cmbCodepage;
+        private CheckBox _chkAutoDetectSub;
+        private ComboBox _cmbOpenSubLang;
+        private TextBox _txtOpenSubApiKey;
         private Panel _previewCanvas;
 
         private string _subTextHex;
@@ -445,6 +448,35 @@ namespace CastMPV.UI
             _subtitlePanel.Controls.Add(btnResetDefaults);
             y += 36;
 
+            _chkAutoDetectSub = DarkCheck("Auto-detect matching .srt/.ass/.vtt files in local folder or cache", 20, y, _settings.AutoDetectLocalSubtitles);
+            _subtitlePanel.Controls.Add(_chkAutoDetectSub);
+            y += 32;
+
+            _subtitlePanel.Controls.Add(SectionLabel("OpenSubtitles Online Search", 20, y)); y += 26;
+
+            _subtitlePanel.Controls.Add(FieldLabel("Language:", 20, y + 4));
+            _cmbOpenSubLang = new ComboBox
+            {
+                Location = new Point(130, y),
+                Width = 72,
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = ThemePalette.BgElevated,
+                ForeColor = ThemePalette.TextPrimary
+            };
+            _cmbOpenSubLang.Items.AddRange(new object[] { "en", "ar", "es", "fr", "de", "it", "pt", "tr", "ru", "zh", "ja", "ko", "all" });
+            _cmbOpenSubLang.SelectedItem = _cmbOpenSubLang.Items.Contains(_settings.OpenSubtitlesLanguage) ? _settings.OpenSubtitlesLanguage : "en";
+            _subtitlePanel.Controls.Add(_cmbOpenSubLang);
+
+            _subtitlePanel.Controls.Add(FieldLabel("API Key:", 212, y + 4));
+            _txtOpenSubApiKey = DarkTextBox(272, y + 1, 165, _settings.OpenSubtitlesApiKey);
+            _txtOpenSubApiKey.UseSystemPasswordChar = true;
+            _subtitlePanel.Controls.Add(_txtOpenSubApiKey);
+
+            var btnSearchOpenSubs = MakeSecondaryButton("Search OpenSubtitles...", 446, y - 1, 157, 26);
+            btnSearchOpenSubs.Click += SearchOpenSubtitlesClicked;
+            _subtitlePanel.Controls.Add(btnSearchOpenSubs);
+            y += 36;
+
             // Live Preview Box
             _previewCanvas = new Panel
             {
@@ -570,6 +602,22 @@ namespace CastMPV.UI
             }
         }
 
+        private void SearchOpenSubtitlesClicked(object sender, EventArgs e)
+        {
+            _settings.OpenSubtitlesApiKey = _txtOpenSubApiKey.Text?.Trim() ?? string.Empty;
+            _settings.OpenSubtitlesLanguage = _cmbOpenSubLang.SelectedItem?.ToString() ?? "en";
+            _settings.Save();
+
+            using var dlg = new OpenSubtitlesForm(_settings);
+            if (dlg.ShowDialog(this) == DialogResult.OK && !string.IsNullOrWhiteSpace(dlg.DownloadedSubtitlePath))
+            {
+                _loadSubtitleCallback?.Invoke(dlg.DownloadedSubtitlePath);
+            }
+            _txtOpenSubApiKey.Text = _settings.OpenSubtitlesApiKey;
+            if (_cmbOpenSubLang.Items.Contains(_settings.OpenSubtitlesLanguage))
+                _cmbOpenSubLang.SelectedItem = _settings.OpenSubtitlesLanguage;
+        }
+
         private void ResetSubtitleDefaults(object sender, EventArgs e)
         {
             _syncingControls = true;
@@ -691,6 +739,9 @@ namespace CastMPV.UI
             _settings.SubtitleDefaultDelay = (double)_numSubDelay.Value;
             _settings.SubtitleAssOverride = _cmbAssOverride.SelectedItem?.ToString() ?? "yes";
             _settings.SubtitleCodepage = _cmbCodepage.SelectedItem?.ToString() ?? "auto";
+            _settings.AutoDetectLocalSubtitles = _chkAutoDetectSub.Checked;
+            _settings.OpenSubtitlesLanguage = _cmbOpenSubLang.SelectedItem?.ToString() ?? "en";
+            _settings.OpenSubtitlesApiKey = _txtOpenSubApiKey.Text?.Trim() ?? string.Empty;
 
             _settings.Save();
             StartupManager.SetAutoStart(_chkAutoStartWindows.Checked);

@@ -98,6 +98,9 @@ namespace CastMPV
                 var subSettingsItem = new ToolStripMenuItem("Subtitle Settings...");
                 subSettingsItem.Click += (s, e) => OpenSettings(1);
 
+                var searchOpenSubsItem = new ToolStripMenuItem("Search OpenSubtitles...");
+                searchOpenSubsItem.Click += (s, e) => _mainForm.OpenOpenSubtitlesDialog();
+
                 var exitItem = new ToolStripMenuItem("Exit CastMPV");
                 exitItem.Click += (s, e) => ExitApplication();
 
@@ -110,6 +113,7 @@ namespace CastMPV
                     _autoStartItem,
                     settingsItem,
                     subSettingsItem,
+                    searchOpenSubsItem,
                     new ToolStripSeparator(),
                     exitItem
                 });

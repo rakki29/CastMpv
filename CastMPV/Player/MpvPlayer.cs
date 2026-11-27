@@ -45,6 +45,8 @@ namespace CastMPV.Player
         private string _currentUri = string.Empty;
         private string _currentTitle = string.Empty;
         private string _aspectMode = "Original";
+        private string _defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+        private readonly List<string> _pendingSubtitleTracks = new List<string>();
 
         public event Action<double> PositionChanged;
         public event Action<double> DurationChanged;
@@ -72,6 +74,7 @@ namespace CastMPV.Player
         public bool Initialize(IntPtr windowHandle, AppSettings settings, out string errorMessage)
         {
             long wid = windowHandle.ToInt64();
+            _defaultUserAgent = settings.DefaultUserAgent;
 
             bool ok = MpvNative.CreateAndInitializeOnMtaThread(ctx =>
             {
@@ -92,15 +95,28 @@ namespace CastMPV.Player
                 SetOption("vo", "gpu,direct3d,sdl");
                 SetOption("hwdec", settings.HardwareAcceleration ? "auto-safe" : "no");
 
-                // Robust stream caching & reconnect for HTTP/HLS/DASH/IPTV
+                // Full HLS (m3u8), DASH (mpd), IPTV, and remote MP4 network stream resilience
                 SetOption("cache", "yes");
+                SetOption("cache-on-disk", "no");
                 SetOption("demuxer-max-bytes", "150MiB");
                 SetOption("demuxer-max-back-bytes", "50MiB");
-                SetOption("network-timeout", "15");
-                SetOption("stream-lavf-o", "reconnect=1,reconnect_streamed=1,reconnect_delay_max=5");
+                SetOption("demuxer-readahead-secs", "20");
+                SetOption("network-timeout", "20");
+                SetOption("load-unsafe-playlists", "yes");
+                SetOption("tls-verify", "no");
+                SetOption("hls-bitrate", "max");
+                SetOption("force-seekable", "yes");
+                SetOption("demuxer-lavf-hacks", "yes");
+                SetOption("demuxer-lavf-probesize", "10000000");
+                SetOption("demuxer-lavf-analyzeduration", "5");
+                SetOption("demuxer-lavf-o", "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=5");
+                SetOption("stream-lavf-o", "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=5");
                 SetOption("ytdl", "no");
+                if (!string.IsNullOrWhiteSpace(_defaultUserAgent))
+                    SetOption("user-agent", _defaultUserAgent.Trim());
 
                 // Full UTF-8 / Arabic RTL shaping & subtitle defaults
+                SetOption("audio-file-auto", "fuzzy");
                 SetOption("sub-auto", "fuzzy");
                 SetOption("sub-font-provider", "auto");
                 ApplySubtitleOptionsBeforeInit(settings);
@@ -170,7 +186,13 @@ namespace CastMPV.Player
                 MpvNative.mpv_observe_property(_mpv, id, MpvNative.ToUtf8(name), format);
         }
 
-        public void LoadMedia(string uri, string title = null, string userAgent = null, string referer = null, double defaultSubDelay = 0.0)
+        public void LoadMedia(
+            string uri,
+            string title = null,
+            string userAgent = null,
+            string referer = null,
+            double defaultSubDelay = 0.0,
+            IEnumerable<string> subtitleTracks = null)
         {
             if (string.IsNullOrWhiteSpace(uri) || !IsInitialized) return;
 
@@ -180,15 +202,25 @@ namespace CastMPV.Player
                 _currentTitle = string.IsNullOrWhiteSpace(title) ? InferTitleFromUri(_currentUri) : title.Trim();
                 _subDelay = Math.Round(defaultSubDelay, 2);
 
-                if (!string.IsNullOrWhiteSpace(userAgent))
+                _pendingSubtitleTracks.Clear();
+                if (subtitleTracks != null)
                 {
-                    SetPropertyString("user-agent", userAgent.Trim());
+                    foreach (string sub in subtitleTracks)
+                    {
+                        if (!string.IsNullOrWhiteSpace(sub))
+                            _pendingSubtitleTracks.Add(sub.Trim());
+                    }
                 }
+
+                string effectiveUa = !string.IsNullOrWhiteSpace(userAgent) ? userAgent.Trim() : _defaultUserAgent;
+                if (!string.IsNullOrWhiteSpace(effectiveUa))
+                    SetPropertyString("user-agent", effectiveUa);
 
                 if (!string.IsNullOrWhiteSpace(referer))
                 {
-                    SetPropertyString("referrer", referer.Trim());
-                    SetPropertyString("http-header-fields", $"Referer: {referer.Trim()}");
+                    string cleanRef = referer.Trim();
+                    SetPropertyString("referrer", cleanRef);
+                    SetPropertyString("http-header-fields", $"Referer: {cleanRef}");
                 }
                 else
                 {
@@ -364,6 +396,7 @@ namespace CastMPV.Player
         {
             if (!IsInitialized || settings == null) return;
             settings.Normalize();
+            _defaultUserAgent = settings.DefaultUserAgent;
 
             lock (_sync)
             {
@@ -541,6 +574,7 @@ namespace CastMPV.Player
                 {
                     case MpvEventId.FileLoaded:
                         _isPlaying = true;
+                        AttachPendingSubtitles();
                         FileLoaded?.Invoke();
                         break;
 
@@ -562,6 +596,25 @@ namespace CastMPV.Player
                             HandlePropertyChange(prop);
                         }
                         break;
+                }
+            }
+        }
+
+        private void AttachPendingSubtitles()
+        {
+            List<string> pending;
+            lock (_sync)
+            {
+                if (_pendingSubtitleTracks.Count == 0) return;
+                pending = new List<string>(_pendingSubtitleTracks);
+                _pendingSubtitleTracks.Clear();
+            }
+
+            for (int i = 0; i < pending.Count; i++)
+            {
+                lock (_sync)
+                {
+                    ExecuteCommand("sub-add", pending[i], i == 0 ? "select" : "auto");
                 }
             }
         }

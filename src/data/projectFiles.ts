@@ -6,6 +6,8 @@ import programCs from '../../CastMPV/Program.cs?raw';
 import appSettingsCs from '../../CastMPV/Core/AppSettings.cs?raw';
 import startupManagerCs from '../../CastMPV/Core/StartupManager.cs?raw';
 import iconFactoryCs from '../../CastMPV/Core/IconFactory.cs?raw';
+import subtitleCacheManagerCs from '../../CastMPV/Core/SubtitleCacheManager.cs?raw';
+import openSubtitlesClientCs from '../../CastMPV/Core/OpenSubtitlesClient.cs?raw';
 import mpvNativeCs from '../../CastMPV/Player/MpvNative.cs?raw';
 import mpvPlayerCs from '../../CastMPV/Player/MpvPlayer.cs?raw';
 import dlnaServerCs from '../../CastMPV/DLNA/DlnaServer.cs?raw';
@@ -14,6 +16,7 @@ import darkControlsCs from '../../CastMPV/UI/DarkControls.cs?raw';
 import mainFormCs from '../../CastMPV/UI/MainForm.cs?raw';
 import openUrlFormCs from '../../CastMPV/UI/OpenUrlForm.cs?raw';
 import settingsFormCs from '../../CastMPV/UI/SettingsForm.cs?raw';
+import openSubtitlesFormCs from '../../CastMPV/UI/OpenSubtitlesForm.cs?raw';
 
 export interface ProjectFileEntry {
   id: string;
@@ -90,6 +93,22 @@ export const PROJECT_FILES: ProjectFileEntry[] = [
     content: iconFactoryCs,
   },
   {
+    id: 'subtitle-cache',
+    path: 'CastMPV/Core/SubtitleCacheManager.cs',
+    category: 'Entry & Core',
+    language: 'csharp',
+    summary: 'Safe local subtitle caching, HTTP/HTTPS subtitle download, and fuzzy local/cached .srt auto-detection.',
+    content: subtitleCacheManagerCs,
+  },
+  {
+    id: 'opensubtitles-client',
+    path: 'CastMPV/Core/OpenSubtitlesClient.cs',
+    category: 'Entry & Core',
+    language: 'csharp',
+    summary: 'Zero-dependency OpenSubtitles REST API v1 and legacy search/download client.',
+    content: openSubtitlesClientCs,
+  },
+  {
     id: 'mpv-native',
     path: 'CastMPV/Player/MpvNative.cs',
     category: 'libmpv Engine',
@@ -142,8 +161,16 @@ export const PROJECT_FILES: ProjectFileEntry[] = [
     path: 'CastMPV/UI/SettingsForm.cs',
     category: 'PotPlayer UI',
     language: 'csharp',
-    summary: 'Settings dialog for DLNA name/port, auto-fullscreen, Windows startup, hwdec, and subtitle defaults.',
+    summary: 'Settings dialog for DLNA name/port, auto-fullscreen, Windows startup, hwdec, subtitle styling, and OpenSubtitles.',
     content: settingsFormCs,
+  },
+  {
+    id: 'opensubtitlesform',
+    path: 'CastMPV/UI/OpenSubtitlesForm.cs',
+    category: 'PotPlayer UI',
+    language: 'csharp',
+    summary: 'OpenSubtitles search & download dialog with language filter and instant subtitle attachment.',
+    content: openSubtitlesFormCs,
   },
   {
     id: 'theme',

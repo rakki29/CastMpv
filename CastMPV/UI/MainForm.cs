@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using CastMPV.Core;
 using CastMPV.DLNA;
@@ -134,10 +135,12 @@ namespace CastMPV.UI
 
             var btnOpenFile = MakeTopButton("Open File", (s, e) => OpenFileDialog());
             var btnOpenUrl = MakeTopButton("Open URL", (s, e) => OpenUrlDialog());
+            var btnLoadSub = MakeTopButton("Load Subtitle", (s, e) => LoadSubtitleDialog());
+            var btnSearchSub = MakeTopButton("Search Subs", (s, e) => OpenOpenSubtitlesDialog());
             _btnPin = MakeTopButton("Pin", (s, e) => ToggleAlwaysOnTop());
             var btnSettings = MakeTopButton("Settings", (s, e) => _openSettingsCallback?.Invoke(0));
 
-            topRight.Controls.AddRange(new Control[] { btnOpenFile, btnOpenUrl, _btnPin, btnSettings });
+            topRight.Controls.AddRange(new Control[] { btnOpenFile, btnOpenUrl, btnLoadSub, btnSearchSub, _btnPin, btnSettings });
             _topBar.Controls.Add(_lblTitle);
             _topBar.Controls.Add(lblBrand);
             _topBar.Controls.Add(topRight);
@@ -328,6 +331,8 @@ namespace CastMPV.UI
             _videoContextMenu.Items.Add("Stop", null, (s, e) => StopPlayback());
             _videoContextMenu.Items.Add(new ToolStripSeparator());
             _videoContextMenu.Items.Add("Load External Subtitle...", null, (s, e) => LoadSubtitleDialog());
+            _videoContextMenu.Items.Add("Search OpenSubtitles...", null, (s, e) => OpenOpenSubtitlesDialog());
+            _videoContextMenu.Items.Add("Auto-Detect Local Subtitle", null, (s, e) => AutoDetectAndApplySubtitle(_player.CurrentUri, _player.CurrentTitle, showMissingOsd: true));
             _videoContextMenu.Items.Add("Subtitle Settings...", null, (s, e) => _openSettingsCallback?.Invoke(1));
             _videoContextMenu.Items.Add("Capture Screenshot", null, (s, e) => TakeScreenshot());
             _videoContextMenu.Items.Add("Toggle Fullscreen", null, (s, e) => ToggleFullscreen());
@@ -457,8 +462,78 @@ namespace CastMPV.UI
                 }
 
                 _lblIdleHint.Visible = false;
-                _player.LoadMedia(request.Uri, request.Title, request.UserAgent, request.Referer, _settings.SubtitleDefaultDelay);
-                ShowOsd(string.IsNullOrWhiteSpace(request.Title) ? "Playing stream..." : request.Title);
+
+                List<string> localSubs = _settings.AutoDetectLocalSubtitles
+                    ? SubtitleCacheManager.FindMatchingLocalSubtitles(request.Uri, request.Title)
+                    : new List<string>();
+
+                bool hasRemoteSubs = request.SubtitleUrls != null && request.SubtitleUrls.Count > 0;
+                _player.LoadMedia(
+                    request.Uri,
+                    request.Title,
+                    request.UserAgent,
+                    request.Referer,
+                    _settings.SubtitleDefaultDelay,
+                    hasRemoteSubs ? null : localSubs);
+
+                if (hasRemoteSubs)
+                {
+                    ShowOsd(string.IsNullOrWhiteSpace(request.Title) ? "Playing stream (loading cast subtitle)..." : $"{request.Title} (loading subtitle)");
+                    AttachDlnaSubtitlesAsync(request);
+                }
+                else if (localSubs.Count > 0)
+                {
+                    ShowOsd($"Subtitle auto-loaded: {Path.GetFileName(localSubs[0])}");
+                }
+                else
+                {
+                    ShowOsd(string.IsNullOrWhiteSpace(request.Title) ? "Playing stream..." : request.Title);
+                }
+            });
+        }
+
+        private void AttachDlnaSubtitlesAsync(CastMediaRequest request)
+        {
+            var urls = new List<string>(request.SubtitleUrls);
+            string title = request.Title;
+            string ua = request.UserAgent ?? _settings.DefaultUserAgent;
+            string referer = request.Referer;
+            string expectedUri = request.Uri;
+
+            Task.Run(async () =>
+            {
+                bool anyLoaded = false;
+                for (int i = 0; i < urls.Count; i++)
+                {
+                    string subUrl = urls[i];
+                    string cachedPath = null;
+                    try
+                    {
+                        cachedPath = await SubtitleCacheManager.DownloadSubtitleToCacheAsync(subUrl, title, ua, referer).ConfigureAwait(false);
+                    }
+                    catch { }
+
+                    string trackToLoad = !string.IsNullOrWhiteSpace(cachedPath) ? cachedPath : subUrl;
+                    BeginUi(() =>
+                    {
+                        if (!string.Equals(_player.CurrentUri, expectedUri, StringComparison.OrdinalIgnoreCase))
+                            return;
+
+                        _player.AddExternalSubtitle(trackToLoad);
+                        if (!anyLoaded)
+                        {
+                            anyLoaded = true;
+                            ShowOsd(!string.IsNullOrWhiteSpace(cachedPath)
+                                ? $"DLNA Subtitle loaded: {Path.GetFileName(cachedPath)}"
+                                : "DLNA Subtitle attached");
+                        }
+                    });
+                }
+
+                if (!anyLoaded && _settings.AutoDetectLocalSubtitles)
+                {
+                    BeginUi(() => AutoDetectAndApplySubtitle(expectedUri, title, showMissingOsd: false));
+                }
             });
         }
 
@@ -524,7 +599,13 @@ namespace CastMPV.UI
             {
                 _castSessionActive = false;
                 _lblIdleHint.Visible = false;
-                _player.LoadMedia(dlg.FileName, Path.GetFileName(dlg.FileName), defaultSubDelay: _settings.SubtitleDefaultDelay);
+                string title = Path.GetFileName(dlg.FileName);
+                List<string> subs = _settings.AutoDetectLocalSubtitles
+                    ? SubtitleCacheManager.FindMatchingLocalSubtitles(dlg.FileName, title)
+                    : null;
+                _player.LoadMedia(dlg.FileName, title, defaultSubDelay: _settings.SubtitleDefaultDelay, subtitleTracks: subs);
+                if (subs != null && subs.Count > 0)
+                    ShowOsd($"Subtitle auto-loaded: {Path.GetFileName(subs[0])}");
             }
         }
 
@@ -536,7 +617,12 @@ namespace CastMPV.UI
             {
                 _castSessionActive = false;
                 _lblIdleHint.Visible = false;
-                _player.LoadMedia(dlg.MediaUrl, null, dlg.CustomUserAgent, dlg.CustomReferer, _settings.SubtitleDefaultDelay);
+                List<string> subs = _settings.AutoDetectLocalSubtitles
+                    ? SubtitleCacheManager.FindMatchingLocalSubtitles(dlg.MediaUrl, null)
+                    : null;
+                _player.LoadMedia(dlg.MediaUrl, null, dlg.CustomUserAgent, dlg.CustomReferer, _settings.SubtitleDefaultDelay, subs);
+                if (subs != null && subs.Count > 0)
+                    ShowOsd($"Subtitle auto-loaded: {Path.GetFileName(subs[0])}");
             }
         }
 
@@ -551,6 +637,31 @@ namespace CastMPV.UI
             {
                 _player.AddExternalSubtitle(dlg.FileName);
                 ShowOsd($"Subtitle loaded: {Path.GetFileName(dlg.FileName)}");
+            }
+        }
+
+        public void OpenOpenSubtitlesDialog()
+        {
+            EnsureVisibleAndFocused();
+            using var dlg = new OpenSubtitlesForm(_settings, _player.CurrentTitle);
+            if (dlg.ShowDialog(this) == DialogResult.OK && !string.IsNullOrWhiteSpace(dlg.DownloadedSubtitlePath))
+            {
+                _player.AddExternalSubtitle(dlg.DownloadedSubtitlePath);
+                ShowOsd($"OpenSubtitles applied: {Path.GetFileName(dlg.DownloadedSubtitlePath)}");
+            }
+        }
+
+        private void AutoDetectAndApplySubtitle(string uri, string title, bool showMissingOsd)
+        {
+            List<string> matches = SubtitleCacheManager.FindMatchingLocalSubtitles(uri, title);
+            if (matches.Count > 0)
+            {
+                _player.AddExternalSubtitle(matches[0]);
+                ShowOsd($"Auto-loaded subtitle: {Path.GetFileName(matches[0])}");
+            }
+            else if (showMissingOsd)
+            {
+                ShowOsd("No matching .srt found in local folder or cache");
             }
         }
 
@@ -624,6 +735,8 @@ namespace CastMPV.UI
         {
             var menu = CreateDarkDropdown();
             menu.Items.Add("Load External Subtitle (SRT/ASS/VTT)...", null, (_, __) => LoadSubtitleDialog());
+            menu.Items.Add("Search OpenSubtitles...", null, (_, __) => OpenOpenSubtitlesDialog());
+            menu.Items.Add("Auto-Detect Local/Cached Subtitles", null, (_, __) => AutoDetectAndApplySubtitle(_player.CurrentUri, _player.CurrentTitle, showMissingOsd: true));
             menu.Items.Add("Subtitle Settings & Styling...", null, (_, __) => _openSettingsCallback?.Invoke(1));
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add($"Delay -0.1s [G] (Current: {_player.SubtitleDelay:+0.0;-0.0;0.0}s)", null, (_, __) => AdjustSubDelay(-0.1));
@@ -798,7 +911,11 @@ namespace CastMPV.UI
             {
                 _castSessionActive = false;
                 _lblIdleHint.Visible = false;
-                _player.LoadMedia(first, Path.GetFileName(first), defaultSubDelay: _settings.SubtitleDefaultDelay);
+                string title = Path.GetFileName(first);
+                List<string> subs = _settings.AutoDetectLocalSubtitles
+                    ? SubtitleCacheManager.FindMatchingLocalSubtitles(first, title)
+                    : null;
+                _player.LoadMedia(first, title, defaultSubDelay: _settings.SubtitleDefaultDelay, subtitleTracks: subs);
             }
         }
 
