@@ -50,11 +50,16 @@ jobs:
           # Create a lightweight native smoke-test project to verify mpv_create + mpv_initialize on Windows
           $probeDir = Join-Path $env:RUNNER_TEMP "mpv-probe-${{ matrix.arch }}"
           New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+          $probeOut = Join-Path $probeDir "out"
+          New-Item -ItemType Directory -Force -Path $probeOut | Out-Null
+
           @'
           <Project Sdk="Microsoft.NET.Sdk">
             <PropertyGroup>
               <OutputType>Exe</OutputType>
+              <AssemblyName>MpvProbe</AssemblyName>
               <TargetFramework>net48</TargetFramework>
+              <Platforms>x64;x86</Platforms>
               <PlatformTarget>$(Platform)</PlatformTarget>
             </PropertyGroup>
           </Project>
@@ -65,12 +70,14 @@ jobs:
           using System.Runtime.InteropServices;
           using System.Text;
           class Program {
+              [DllImport("kernel32.dll")] static extern uint SetErrorMode(uint uMode);
               [DllImport("libmpv-2.dll", CallingConvention = CallingConvention.Cdecl)] static extern IntPtr mpv_create();
               [DllImport("libmpv-2.dll", CallingConvention = CallingConvention.Cdecl)] static extern int mpv_set_option_string(IntPtr ctx, byte[] name, byte[] val);
               [DllImport("libmpv-2.dll", CallingConvention = CallingConvention.Cdecl)] static extern int mpv_initialize(IntPtr ctx);
               [DllImport("libmpv-2.dll", CallingConvention = CallingConvention.Cdecl)] static extern void mpv_terminate_destroy(IntPtr ctx);
               static byte[] U(string s) => Encoding.UTF8.GetBytes(s + "\0");
               static int Main() {
+                  SetErrorMode(0x0001 | 0x0002 | 0x8000);
                   Environment.SetEnvironmentVariable("OPENSSL_CONF", null);
                   Environment.SetEnvironmentVariable("OPENSSL_MODULES", null);
                   IntPtr ctx = mpv_create();
@@ -85,7 +92,14 @@ jobs:
           }
           '@ | Set-Content (Join-Path $probeDir "Program.cs")
 
-          dotnet build (Join-Path $probeDir "MpvProbe.csproj") -c Release -p:Platform=${{ matrix.arch }} -o $probeDir | Out-Null
+          dotnet build (Join-Path $probeDir "MpvProbe.csproj") -c Release -p:Platform=${{ matrix.arch }} -o $probeOut
+          if ($LASTEXITCODE -ne 0) {
+            throw "MpvProbe build failed with exit code $LASTEXITCODE"
+          }
+          $probeExe = Join-Path $probeOut "MpvProbe.exe"
+          if (-not (Test-Path $probeExe)) {
+            throw "MpvProbe.exe was not found at $probeExe"
+          }
 
           $verified = $false
           foreach ($rel in $releases) {
@@ -118,9 +132,14 @@ jobs:
               continue
             }
 
-            # Live Windows smoke test (mpv_create + mpv_initialize)
-            Copy-Item $dll.FullName -Destination (Join-Path $probeDir "libmpv-2.dll") -Force
-            $proc = Start-Process -FilePath (Join-Path $probeDir "MpvProbe.exe") -WorkingDirectory $probeDir -Wait -PassThru -NoNewWindow
+            # Live Windows smoke test (mpv_create + mpv_initialize) with 15s timeout
+            Copy-Item $dll.FullName -Destination (Join-Path $probeOut "libmpv-2.dll") -Force
+            $proc = Start-Process -FilePath $probeExe -WorkingDirectory $probeOut -PassThru -NoNewWindow
+            if (-not $proc.WaitForExit(15000)) {
+              try { $proc.Kill() } catch {}
+              Write-Warning "$($asset.name) timed out during Windows smoke test; trying previous release..."
+              continue
+            }
             if ($proc.ExitCode -eq 0) {
               Copy-Item $dll.FullName -Destination (Join-Path $nativeDir "libmpv-2.dll") -Force
               Write-Host "Verified clean libmpv-2.dll ($([math]::Round($dll.Length / 1MB, 2)) MB) from $($rel.tag_name)"
